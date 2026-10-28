@@ -123,10 +123,21 @@ async fn session_and_settings_sync_server_provider_id() {
     let first_id = ThreadId::new();
     let mut first = configured_thread_session(first_id);
     first.model_provider_id = "server-ollama".to_string();
+    chat.status_account_display = Some(StatusAccountDisplay::ChatGpt {
+        email: None,
+        plan: None,
+        workspace: Some("account-123".to_string()),
+    });
+    let mut provider = chat.config.model_provider.clone();
+    provider.env_key = Some("CUSTOM_API_KEY".to_string());
+    chat.config
+        .model_providers
+        .insert(first.model_provider_id.clone(), provider);
     chat.handle_thread_session(first.clone());
     let displayed = status(&mut chat);
     assert!(displayed.contains("Model provider:") && displayed.contains("server-ollama"));
     assert!(!displayed.contains("local-provider.example"));
+    assert!(!displayed.contains("ChatGPT workspace:"));
 
     let mut other = configured_thread_session(ThreadId::new());
     other.model_provider_id = "server-bedrock".to_string();
@@ -1878,46 +1889,63 @@ async fn live_app_server_rate_limit_error_renders_upstream_message() {
 
 #[tokio::test]
 async fn live_app_server_server_overloaded_error_renders_error() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    for (message, error_info) in [
+        ("server overloaded", CodexErrorInfo::ServerOverloaded),
+        (
+            "server overloaded",
+            CodexErrorInfo::PolicyCapacityUnavailable,
+        ),
+        ("", CodexErrorInfo::ServerOverloaded),
+        ("", CodexErrorInfo::PolicyCapacityUnavailable),
+    ] {
+        let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
-    chat.handle_server_notification(
-        ServerNotification::TurnStarted(TurnStartedNotification {
-            thread_id: "thread-1".to_string(),
-            turn: AppServerTurn {
-                id: "turn-1".to_string(),
-                root_turn_id: None,
-                items_view: codex_app_server_protocol::TurnItemsView::Full,
-                items: Vec::new(),
-                status: AppServerTurnStatus::InProgress,
-                error: None,
-                started_at: Some(0),
-                completed_at: None,
-                duration_ms: None,
-            },
-        }),
-        /*replay_kind*/ None,
-    );
-    drain_insert_history(&mut rx);
+        chat.handle_server_notification(
+            ServerNotification::TurnStarted(TurnStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn: AppServerTurn {
+                    id: "turn-1".to_string(),
+                    root_turn_id: None,
+                    items_view: codex_app_server_protocol::TurnItemsView::Full,
+                    items: Vec::new(),
+                    status: AppServerTurnStatus::InProgress,
+                    error: None,
+                    started_at: Some(0),
+                    completed_at: None,
+                    duration_ms: None,
+                },
+            }),
+            /*replay_kind*/ None,
+        );
+        drain_insert_history(&mut rx);
 
-    chat.handle_server_notification(
-        ServerNotification::Error(ErrorNotification {
-            error: AppServerTurnError {
-                misalignment: None,
-                message: "server overloaded".to_string(),
-                codex_error_info: Some(CodexErrorInfo::ServerOverloaded),
-                additional_details: None,
-            },
-            will_retry: false,
-            thread_id: "thread-1".to_string(),
-            turn_id: "turn-1".to_string(),
-        }),
-        /*replay_kind*/ None,
-    );
+        chat.handle_server_notification(
+            ServerNotification::Error(ErrorNotification {
+                error: AppServerTurnError {
+                    misalignment: None,
+                    message: message.to_string(),
+                    codex_error_info: Some(error_info),
+                    additional_details: None,
+                },
+                will_retry: false,
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+            }),
+            /*replay_kind*/ None,
+        );
 
-    let cells = drain_insert_history(&mut rx);
-    assert_eq!(cells.len(), 1);
-    assert_eq!(lines_to_single_string(&cells[0]), "■ server overloaded\n");
-    assert!(!chat.bottom_pane.is_task_running());
+        let cells = drain_insert_history(&mut rx);
+        assert_eq!(cells.len(), 1);
+        let rendered = lines_to_single_string(&cells[0]);
+        insta::allow_duplicates! {
+            if message.is_empty() {
+                insta::assert_snapshot!(rendered, @"■ Codex is currently experiencing high load.");
+            } else {
+                insta::assert_snapshot!(rendered, @"■ server overloaded");
+            }
+        }
+        assert!(!chat.bottom_pane.is_task_running());
+    }
 }
 
 #[tokio::test]

@@ -632,16 +632,7 @@ impl App {
                             } else {
                                 None
                             };
-                            if !app_server.uses_embedded_app_server() {
-                                // Daemon tasks can start while the fork RPC is pending.
-                                for id in self.thread_event_channels.keys().copied()
-                                    .chain(self.agent_navigation.tracked_thread_ids())
-                                    .filter(|id| !self.side_threads.contains_key(id))
-                                {
-                                    self.agents_overview.dispatched_requests.entry(id).or_default();
-                                }
-                            }
-                            self.detach_current_thread_for_navigation(app_server, Some(forked.session.thread_id)).await;
+                            self.detach_current_thread_for_fork(app_server, forked.session.thread_id).await;
                             match self
                                 .replace_chat_widget_with_app_server_thread(
                                     tui,
@@ -1247,6 +1238,16 @@ impl App {
                 )
                 .await;
             }
+            AppEvent::ContinueSafetyRecourse {
+                thread_id,
+                turn_id,
+                prompt,
+            } => {
+                super::safety_recourse::continue_with_rewrite(
+                    self, tui, app_server, thread_id, turn_id, prompt,
+                )
+                .await;
+            }
             AppEvent::AppendMessageHistoryEntry { thread_id, text } => {
                 self.append_message_history_entry(thread_id, text);
             }
@@ -1332,10 +1333,10 @@ impl App {
                         elicitation_target: None,
                     });
             }
-            AppEvent::AccountEmailLoaded { request_id, email } => {
+            AppEvent::AccountEmailLoaded { request_id, email, workspace } => {
                 if self.account_email_request_id == Some(request_id) {
                     self.account_email_request_id = None;
-                    self.chat_widget.on_account_email_loaded(email);
+                    self.chat_widget.on_account_email_loaded(email, workspace);
                 }
             }
             AppEvent::SecuritySetupLoaded { request_id, identity, notice } => {

@@ -50,7 +50,7 @@ async fn handoff(
     Ok(())
 }
 
-pub(crate) async fn handoff_scenario() -> Result<Vec<ResponsesRequest>> {
+pub(crate) async fn handoff_scenario(native_history: bool) -> Result<Vec<ResponsesRequest>> {
     let server = start_mock_server().await;
     let mut extensions = ExtensionRegistryBuilder::new();
     extensions.thread_lifecycle_contributor(Arc::new(ThreadIdle));
@@ -60,7 +60,7 @@ pub(crate) async fn handoff_scenario() -> Result<Vec<ResponsesRequest>> {
             model.multi_agent_version = Some(codex_protocol::protocol::MultiAgentVersion::V2);
         })
         .with_extensions(Arc::new(extensions.build()))
-        .with_config(|config| {
+        .with_config(move |config| {
             for feature in [
                 Feature::Collab,
                 Feature::MultiAgentV2,
@@ -70,6 +70,12 @@ pub(crate) async fn handoff_scenario() -> Result<Vec<ResponsesRequest>> {
                     .features
                     .enable(feature)
                     .expect("enable multi-agent feature");
+            }
+            if native_history {
+                config
+                    .features
+                    .enable(Feature::GuardianNativeMultiAgentHistory)
+                    .expect("enable native multi-agent history");
             }
             config.multi_agent_v2.max_concurrent_threads_per_session = 4;
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
@@ -289,6 +295,41 @@ pub(crate) async fn handoff_scenario() -> Result<Vec<ResponsesRequest>> {
         GuardianRootMessage::Assistant("Inspect the metrics too?".to_owned()),
     );
     assert_eq!(root_messages(&leaf).await, expected);
+
+    // An old ID-less checkpoint stores an excerpt beside the original legacy backup.
+    // The worker must receive one capped copy and preserve both evidence gaps.
+    let original = "Never publish project details. ".repeat(200);
+    let excerpt = codex_guardian_context::truncate_text(&original, /*max_tokens*/ 900);
+    let history = serde_json::from_value(json!([{"type":"compacted", "payload": {
+        "message":"Old ID-less checkpoint.", "replacement_history":[],
+        "guardian_history":[{"type":"message", "role":"user",
+            "content":[{"type":"input_text", "text":original}]}],
+        "retained_context":{
+            "user_messages":[{"turn_id":"", "text":excerpt, "complete":false}],
+            "user_messages_incomplete":true, "incomplete":false,
+            "verified_answers":[{"turn_id":"large", "call_id":"large", "questions":[{
+                "question":"Publish?", "answer":"Only if conditions hold. ".repeat(200)
+            }]}]
+        }
+    }}]))?;
+    test.codex =
+        crate::suite::guardian_checkpoint_migration::resume(&test, &test.codex, history).await?;
+    let snapshot = leaf.guardian_root_snapshot().await.expect("migrated root");
+    assert_eq!(
+        (
+            snapshot.messages,
+            snapshot.authorization_version.retained_context_complete
+        ),
+        (
+            vec![
+                GuardianRootMessage::RetainedContextScope,
+                GuardianRootMessage::IncompleteRootInstructions,
+                GuardianRootMessage::IncompleteVerifiedAnswers,
+                GuardianRootMessage::User(excerpt),
+            ],
+            false
+        )
+    );
 
     let shutdown = test
         .thread_manager

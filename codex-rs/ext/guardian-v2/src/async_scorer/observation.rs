@@ -76,6 +76,16 @@ impl GuardianV2Extension {
                 let info = tool.tool_info();
                 GuardianScope::for_mcp_connector(&info.server_name, info.connector_id.as_deref())
             })
+            .or_else(|| {
+                if guardian_config.review_multi_agent_calls {
+                    GuardianScope::for_multi_agent_tool(
+                        input.tool_name,
+                        guardian_config.multi_agent_namespace.as_deref(),
+                    )
+                } else {
+                    None
+                }
+            })
             .or_else(|| GuardianScope::for_tool(input.tool_name));
         // Model policies review nested actions; the Code Mode wrapper leaves their scores alone.
         // The legacy all-tools policy still scores wrappers through `other_tools`.
