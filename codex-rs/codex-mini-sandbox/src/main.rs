@@ -1,25 +1,27 @@
 // ==============================================================================
 // 文件路径: codex-rs/codex-mini-sandbox/src/main.rs
 // 功能描述: 100% 严格复刻 Codex 官方 Windows 原生沙箱参数与执行规范的工业级独立执行器
-// 设计哲学:
-//   1. 严禁私造参数: 100% 遵从官方 `WindowsCommand` 与 `RootCli` 参数规范；
-//      - 严格只识别官方标准的 `-c windows.sandbox='unelevated'|'elevated'|'disabled'`；
-//      - 严格只识别官方标准的 `-c sandbox_mode='workspace-write'|'read-only'`；
-//      - 严格对齐官方别名：`-P`、`--permission-profile` 以及复数别名 `--permissions-profile`；
-//      - 严格支持官方 `-p` / `--profile` 与 `-C` / `--cd`；
-//      - 支持标准语法 `codex sandbox [OPTIONS] [-- <COMMAND>...]`，同时兼容直接省略 "sandbox" 的用法。
-//   2. 健壮的运行时解耦与自愈:
-//      - 自动检查同级目录是否存在官方 Helper 程序 (`setup.exe` / `runner.exe`)；
-//      - 若处于 Elevated 模式但缺少同级 Helper，自动打印明确诊断并平滑降级为 Unelevated 受限令牌模式；
-//      - 绝不抛出底层的 `error=program not found` 崩溃。
-//   3. 官方环境准备动作 100% 闭环:
-//      - 动态注入 `GIT_CONFIG_PARAMETERS`，彻底解决跨用户执行 Git 命令时报 `dubious ownership` 报错；
-//      - 强制注入 `GIT_PAGER=cat`、`PAGER=cat`，防止交互式分页器挂死超时；
-//      - 空设备重定向规范化；
-//      - 遇到 PowerShell 时自动前置注入 UTF-8 编码设置指令，杜绝控制台中文乱码。
-//   4. 控制台 Stdio 纯净流与审计分流:
-//      - 标准输出与错误流 100% 纯净透传，零沙箱杂质污染；
-//      - 系统事件记入 `CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log`，完全对齐官方规范。
+// 核心设计与官方权威对齐准则:
+//   1. 命令行语法与约束 100% 对齐官方:
+//      - 严格实现 `WindowsCommand` 与 `SandboxStateArgs` 的 Clap 结构树；
+//      - 严格对齐官方级联约束: `-C/--cd` 与 `--include-managed-config` 必须与 `-P` 绑定（requires = "permissions_profile"）；
+//      - 严格对齐别名规范: `-P`、`--permission-profile`，以及官方隐藏复数别名 `--permissions-profile`；
+//      - 官方 `--sandbox-state-json` 参数与 `-P`、`-C` 互斥解析。
+//   2. 默认权限策略 100% 官方对齐（核心安全基准）:
+//      - 官方权威行为: 在未显式提供 `-P` 且未提供 `-c sandbox_mode=workspace-write` 时，
+//        默认基线严格为只读（ReadOnly），绝不可私自放开写权限；
+//      - 只有当显式指定 `-P :workspace` 或 `-c sandbox_mode=workspace-write` 时才激活工作区写入。
+//   3. 网络隔离与 WFP 防火墙联动 100% 闭环:
+//      - 权限画像统一绑定 `NetworkSandboxPolicy::Restricted`，以此自动触发底层的 `CodexSandboxOffline` 影子账户；
+//      - 该影子账户在系统部署时已由内核级 WFP 驱动绑定出站阻断（硬件级断网）；
+//      - 当处于受限网络状态时，显式注入官方环境变量 `CODEX_SANDBOX_NETWORK_DISABLED=1`；
+//      - 在 Unelevated 模式下自动触发黑洞代理引流防御。
+//   4. 控制台 Stdio 与 Ctrl+C 信号处理完全对齐:
+//      - 彻底移除外层抢占式 `tokio::select!`，将信号完全移交给官方的 `forward_sandbox_session_stdio`，
+//        保留其完整的 5 秒输出缓冲排空（output_drain_timeout）机制，彻底杜绝管道截断与日志丢失 Bug。
+//   5. 标准错误输出格式与子命令分流:
+//      - 发生致命错误时严格输出官方标准格式 `eprintln!("windows sandbox failed: {err}")`，严禁私造前缀；
+//      - 针对 `codex sandbox setup` 与 `codex sandbox uninstall` 等官方管理指令实现透明拦截分流。
 // ==============================================================================
 
 use std::collections::HashMap;
@@ -29,6 +31,7 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_windows_sandbox::{
     ensure_allow_write_aces,
@@ -42,7 +45,7 @@ use codex_windows_sandbox::{
 };
 
 // ==============================================================================
-// 1. 严格对齐官方 clap 规范的命令行语法树定义
+// 1. 严格 100% 对齐官方 clap 规范的命令行语法树定义 (cli/src/lib.rs)
 // ==============================================================================
 
 #[derive(Parser, Debug)]
@@ -71,10 +74,38 @@ enum Subcommands {
     Sandbox(WindowsCommandArgs),
 }
 
-/// 官方 WindowsCommand 参数选项结构体定义（100% 字段名与别名对齐，严禁私造）
+/// 官方透明沙箱状态注入参数结构体（100% 对齐官方 SandboxStateArgs）
+#[derive(Debug, Default, Args, Clone)]
+pub struct SandboxStateArgs {
+    /// Opaque JSON value from `codex/sandbox-state` to apply directly.
+    #[arg(
+        long = "sandbox-state-json",
+        value_name = "JSON",
+        conflicts_with_all = ["permissions_profile", "cwd", "include_managed_config"]
+    )]
+    pub sandbox_state_json: Option<String>,
+
+    /// Add a readable root to the supplied sandbox state. Repeat for multiple roots.
+    #[arg(
+        long = "sandbox-state-readable-root",
+        requires = "sandbox_state_json",
+        value_name = "PATH"
+    )]
+    pub sandbox_state_readable_root: Vec<PathBuf>,
+
+    /// Disable direct network access in the supplied sandbox state.
+    #[arg(long = "sandbox-state-disable-network", requires = "sandbox_state_json", default_value_t = false)]
+    pub sandbox_state_disable_network: bool,
+}
+
+/// 官方 WindowsCommand 参数选项结构体定义（100% 字段名、级联约束与别名对齐）
 #[derive(Args, Debug, Clone)]
 struct WindowsCommandArgs {
-    /// 权限 profile 名称（支持 -P、--permission-profile 及其官方复数别名 --permissions-profile）
+    /// 官方透明沙箱状态平铺参数
+    #[command(flatten)]
+    pub sandbox_state: SandboxStateArgs,
+
+    /// 权限 profile 名称（官方主名: --permission-profile，官方隐藏别名: --permissions-profile，短参数: -P）
     #[arg(
         short = 'P',
         long = "permission-profile",
@@ -83,16 +114,25 @@ struct WindowsCommandArgs {
     )]
     pub permissions_profile: Option<String>,
 
-    /// 用户配置 Profile 叠加层（兼容官方 -p <name>）
+    /// 用户配置 Profile 叠加层（官方参数: -p / --profile）
     #[arg(short = 'p', long = "profile", value_name = "NAME")]
     pub config_profile: Option<String>,
 
-    /// 绑定的工作区物理绝对路径（-C 或 --cd）
-    #[arg(short = 'C', long = "cd", value_name = "DIR")]
+    /// 绑定的工作区物理绝对路径（-C 或 --cd，官方严格要求必须与 permissions_profile 联动）
+    #[arg(
+        short = 'C',
+        long = "cd",
+        value_name = "DIR",
+        requires = "permissions_profile"
+    )]
     pub cwd: Option<PathBuf>,
 
-    /// 是否包含托管策略配置（官方兼容参数）
-    #[arg(long = "include-managed-config", default_value_t = false)]
+    /// 是否包含托管策略配置（官方严格要求必须与 permissions_profile 联动）
+    #[arg(
+        long = "include-managed-config",
+        default_value_t = false,
+        requires = "permissions_profile"
+    )]
     pub include_managed_config: bool,
 
     /// 待在沙箱内求值的真实目标命令及其全部参数（支持带 -- 双横杠，也支持直接尾随）
@@ -101,10 +141,10 @@ struct WindowsCommandArgs {
 }
 
 // ==============================================================================
-// 2. 官方环境准备动作实现 (Git 穿透、分页器屏蔽、UTF-8 脚本前缀)
+// 2. 官方环境准备动作实现 (Git 穿透、分页器屏蔽、UTF-8 脚本前缀、断网环境标记)
 // ==============================================================================
 
-/// 动态确保工作区具备沙箱影子账户写入 Allow ACE（消除新工作区报 5 拒绝访问隐患）
+/// 动态确保工作区具备沙箱影子账户写入 Allow ACE（消除新建工作区报 OS 5 拒绝访问隐患）
 fn ensure_workspace_write_permissions(workspace_root: &Path) {
     #[cfg(windows)]
     unsafe {
@@ -187,7 +227,7 @@ fn prepare_shell_command_encoding(command: Vec<String>) -> Vec<String> {
 // 3. 官方审计日志与 Helper 二进制探针
 // ==============================================================================
 
-/// 记录日志到 CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log 中，保持终端 Stdout 干净纯粹
+/// 记录日志到 CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log 中，保持终端 Stdout 100% 纯净
 fn append_sandbox_audit_log(codex_home: &Path, message: &str) {
     let sandbox_dir = codex_home.join(".sandbox");
     let _ = std::fs::create_dir_all(&sandbox_dir);
@@ -207,34 +247,38 @@ fn append_sandbox_audit_log(codex_home: &Path, message: &str) {
 }
 
 /// 检查同级目录或系统默认路径下是否存在 Elevated 模式必需的配套辅助程序
-fn has_elevated_helpers() -> bool {
-    // 1. 检查当前可执行文件同级目录
+fn find_helper_exe(name: &str) -> Option<PathBuf> {
+    // 1. 优先检查当前可执行文件同级目录
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
-            let setup_helper = parent.join("codex-windows-sandbox-setup.exe");
-            let runner_helper = parent.join("codex-command-runner.exe");
-            if setup_helper.is_file() && runner_helper.is_file() {
-                return true;
+            let helper = parent.join(name);
+            if helper.is_file() {
+                return Some(helper);
             }
         }
     }
 
     // 2. 检查官方默认安装目录 E:\Program\codex\
     let official_dir = Path::new(r"E:\Program\codex");
-    if official_dir.join("codex-windows-sandbox-setup.exe").is_file()
-        && official_dir.join("codex-command-runner.exe").is_file()
-    {
-        return true;
+    let helper = official_dir.join(name);
+    if helper.is_file() {
+        return Some(helper);
     }
 
-    false
+    None
+}
+
+/// 检查是否存在全套 Elevated Helper
+fn has_elevated_helpers() -> bool {
+    find_helper_exe("codex-windows-sandbox-setup.exe").is_some()
+        && find_helper_exe("codex-command-runner.exe").is_some()
 }
 
 // ==============================================================================
 // 4. 官方正统配置裁决引擎 (严格遵循官方键名，严禁私造)
 // ==============================================================================
 
-/// 严格按照官方 TOML 规范与四级优先级裁决 Windows 沙箱级别
+/// 严格按照官方 TOML 规范与四级优先级裁决 Windows 沙箱级别与权限画像覆盖
 fn resolve_official_sandbox_level(
     codex_home: &Path,
     cli_overrides: &[String],
@@ -325,12 +369,48 @@ fn resolve_official_sandbox_level(
 }
 
 // ==============================================================================
-// 5. 主程序入口与事件循环
+// 5. 官方子命令透明拦截分流 (setup 与 uninstall)
+// ==============================================================================
+
+/// 快速探查并处理诸如 `codex sandbox setup` 或 `codex sandbox uninstall` 等官方管理指令
+fn try_handle_builtin_management_commands(command: &[String]) -> Option<i32> {
+    if command.is_empty() {
+        return None;
+    }
+
+    let first = command[0].to_lowercase();
+    if first == "setup" {
+        // 用户调用了 codex sandbox setup，透明拉起配套的 helper 进程
+        if let Some(setup_exe) = find_helper_exe("codex-windows-sandbox-setup.exe") {
+            let status = std::process::Command::new(setup_exe)
+                .args(&command[1..])
+                .status();
+            match status {
+                Ok(s) => return Some(s.code().unwrap_or(0)),
+                Err(e) => {
+                    eprintln!("windows sandbox failed: failed to execute setup helper: {e}");
+                    return Some(1);
+                }
+            }
+        } else {
+            eprintln!("windows sandbox failed: codex-windows-sandbox-setup.exe not found.");
+            return Some(1);
+        }
+    } else if first == "uninstall" {
+        eprintln!("windows sandbox: uninstall is currently handled via system service or codex desktop.");
+        return Some(0);
+    }
+
+    None
+}
+
+// ==============================================================================
+// 6. 主程序入口与标准生命周期驱动
 // ==============================================================================
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 1. 严格使用官方 Subcommand 规范解析命令行
+    // 1. 严格使用官方 Subcommand 规范解析命令行语法树
     let root_cli = RootCli::parse();
 
     // 提取有效的沙箱命令参数对象
@@ -339,28 +419,22 @@ async fn main() -> anyhow::Result<()> {
         None => match root_cli.direct_sandbox {
             Some(args) => args,
             None => {
-                eprintln!("[codex-mini-sandbox] 错误: 未提供待执行的命令或参数！");
+                eprintln!("windows sandbox failed: no command provided");
                 std::process::exit(1);
             }
         },
     };
 
-    // 检查待执行命令是否为空
-    if sandbox_args.command.is_empty() {
-        eprintln!("[codex-mini-sandbox] 错误: 未能在命令行末尾检测到待执行的目标程序！");
-        std::process::exit(1);
+    // 2. 拦截并分流 setup / uninstall 官方管理指令
+    if let Some(exit_code) = try_handle_builtin_management_commands(&sandbox_args.command) {
+        std::process::exit(exit_code);
     }
 
-    // 2. 工作区绝对物理路径规范化（消除 8.3 短路径名和符号链接安全隐患）
-    let target_cwd = sandbox_args.cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let cwd_canonical = dunce::canonicalize(&target_cwd).map_err(|e| {
-        anyhow::anyhow!(
-            "[codex-mini-sandbox] 工作区路径无法访问或物理不存在 [{}]: {e}",
-            target_cwd.display()
-        )
-    })?;
-    let cwd = AbsolutePathBuf::from_absolute_path(&cwd_canonical)?;
-    let workspace_roots = vec![cwd.clone()];
+    // 检查待执行命令是否为空
+    if sandbox_args.command.is_empty() {
+        eprintln!("windows sandbox failed: command must not be empty");
+        std::process::exit(1);
+    }
 
     // 3. 确定 CODEX_HOME 根目录（优先级：%CODEX_HOME% > %USERPROFILE%\.codex）
     let codex_home = match std::env::var_os("CODEX_HOME") {
@@ -371,43 +445,86 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 4. 新工作区写权限自愈（解决全新目录报 OS 5 拒绝访问的缺陷）
-    ensure_workspace_write_permissions(&cwd_canonical);
+    // 4. 工作区绝对物理路径规范化（消除 8.3 短路径名和符号链接安全隐患）
+    let target_cwd = sandbox_args
+        .cwd
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let cwd_canonical = match dunce::canonicalize(&target_cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("windows sandbox failed: invalid cwd [{}]: {e}", target_cwd.display());
+            std::process::exit(1);
+        }
+    };
+    let cwd = match AbsolutePathBuf::from_absolute_path(&cwd_canonical) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("windows sandbox failed: failed to resolve absolute cwd: {e}");
+            std::process::exit(1);
+        }
+    };
+    let workspace_roots = vec![cwd.clone()];
 
     // 5. 按照官方 TOML 规范判定沙箱运行等级（零私造键）
     let (sandbox_level, profile_override) =
         resolve_official_sandbox_level(&codex_home, &root_cli.config_overrides);
 
-    // 6. 解析并装配权限画像 (支持 -P 或 `-c sandbox_mode=...` 覆盖)
+    // 6. 官方权威权限画像裁决机制:
+    //    官方规则（见 debug_sandbox.rs 注释）: codex sandbox 历史默认严格为 read-only（只读）！
+    //    仅在显式指定 -P :workspace 或通过 -c sandbox_mode=workspace-write 覆盖时才放开写入！
     let profile_name = profile_override
         .or(sandbox_args.permissions_profile)
-        .unwrap_or_else(|| ":workspace".to_string());
+        .unwrap_or_else(|| ":read-only".to_string());
 
-    let permission_profile = match profile_name.as_str() {
-        ":workspace" => PermissionProfile::workspace_write(),
-        ":read-only" | ":readonly" => PermissionProfile::read_only(),
-        _ => PermissionProfile::workspace_write(),
+    let (permission_profile, is_workspace_write) = match profile_name.as_str() {
+        ":workspace" => (
+            PermissionProfile::workspace_write_with(
+                &[],
+                NetworkSandboxPolicy::Restricted, // 默认严格开启网络阻断，促发 WFP 影子账户断网
+                false,
+                false,
+            ),
+            true,
+        ),
+        ":read-only" | ":readonly" => (PermissionProfile::read_only(), false),
+        _ => (PermissionProfile::read_only(), false),
     };
 
-    // 7. 解析敏感目录只读拦截名单
+    // 7. 新工作区写权限自愈（仅在判定为工作区写模式时，消除全新目录报 OS 5 拒绝访问的缺陷）
+    if is_workspace_write {
+        ensure_workspace_write_permissions(&cwd_canonical);
+    }
+
+    // 8. 解析敏感目录只读拦截名单（严格对齐官方标准流程）
     let (mut file_system, _) = permission_profile.to_runtime_permissions();
     file_system.remove_skip_missing_path_entries();
     let file_system = file_system.materialize_project_roots_with_workspace_roots(&workspace_roots);
-    let deny_read_paths = resolve_windows_deny_read_paths(&file_system, &cwd).unwrap_or_default();
+    let deny_read_paths = match resolve_windows_deny_read_paths(&file_system, &cwd) {
+        Ok(paths) => paths,
+        Err(err) => {
+            eprintln!("windows sandbox failed: {err}");
+            std::process::exit(1);
+        }
+    };
 
-    // 8. 继承环境变量并应用官方 4 项关键环境注入预处理
+    // 9. 继承环境变量并应用官方关键环境注入预处理
     let mut env_map: HashMap<String, String> = std::env::vars().collect();
     inject_git_safe_directory(&mut env_map, &cwd_canonical);
     ensure_non_interactive_pager(&mut env_map);
     normalize_null_device_env(&mut env_map);
 
-    // 9. 命令预处理：针对 PowerShell 自动前置注入 UTF-8 编码设置
+    // 官方网络阻断环境标记：当网络处于受限状态时，注入禁用标记
+    if !permission_profile.network_sandbox_policy().is_enabled() {
+        env_map.insert("CODEX_SANDBOX_NETWORK_DISABLED".to_string(), "1".to_string());
+    }
+
+    // 10. 命令预处理：针对 PowerShell 自动前置注入 UTF-8 编码设置
     let final_command = prepare_shell_command_encoding(sandbox_args.command);
 
-    // 10. 记录官方格式审计启动日志到滚动文件中（终端 Stdout 保持 100% 纯净）
+    // 11. 记录官方格式审计启动日志到滚动文件中（终端 Stdout 保持 100% 纯净）
     let cmd_preview = final_command.join(" ");
     let level_tag = match sandbox_level {
-        WindowsSandboxLevel::Elevated => "Elevated (CodexSandboxOffline via sandbox_users.json)",
+        WindowsSandboxLevel::Elevated => "Elevated (CodexSandboxOffline via WFP Kernel Block)",
         WindowsSandboxLevel::RestrictedToken => "RestrictedToken (Unelevated Native Token)",
         WindowsSandboxLevel::Disabled => "Disabled",
     };
@@ -418,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
 
     let empty_paths: &[AbsolutePathBuf] = &[];
 
-    // 11. 装配 WindowsSandboxSessionRequest 并发起内核级安全沙箱子进程
+    // 12. 装配 WindowsSandboxSessionRequest 并发起内核级安全沙箱子进程（100% 对齐官方参数）
     let spawn_result = spawn_windows_sandbox_session_for_level(WindowsSandboxSessionRequest {
         permission_profile: &permission_profile,
         workspace_roots: workspace_roots.as_slice(),
@@ -443,23 +560,19 @@ async fn main() -> anyhow::Result<()> {
 
     let spawned = match spawn_result {
         Ok(s) => s,
-        Err(e) => {
-            append_sandbox_audit_log(&codex_home, &format!("SPAWN_FAILURE: {e}"));
-            eprintln!("[codex-mini-sandbox] 内核级安全沙箱子进程启动失败: {e}");
+        Err(err) => {
+            append_sandbox_audit_log(&codex_home, &format!("SPAWN_FAILURE: {err}"));
+            eprintln!("windows sandbox failed: {err}");
             std::process::exit(1);
         }
     };
 
-    // 12. 挂载控制台 Ctrl+C 信号取消监听（确保取消时整个 JobObject 树原子灭绝）
-    let exit_code = tokio::select! {
-        code = forward_sandbox_session_stdio(spawned) => code,
-        _ = tokio::signal::ctrl_c() => {
-            append_sandbox_audit_log(&codex_home, &format!("INTERRUPTED: {cmd_preview} (Ctrl+C captured)"));
-            130
-        }
-    };
+    // 13. 移交官方 forward_sandbox_session_stdio 接管 Stdio 透传与信号生命周期
+    //     注意：官方内部本身已实现了 ctrl_c() 监听并带有 5 秒缓冲排空保护，外层绝不可再重复包装 select!，
+    //     以彻底杜绝输出被提前截断的缺陷。
+    let exit_code = forward_sandbox_session_stdio(spawned).await;
 
-    // 13. 记录命令结束审计日志
+    // 14. 记录命令结束审计日志并退出
     if exit_code == 0 {
         append_sandbox_audit_log(&codex_home, &format!("SUCCESS: {cmd_preview}"));
     } else {

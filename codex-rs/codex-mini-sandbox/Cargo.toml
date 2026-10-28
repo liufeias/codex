@@ -3,36 +3,36 @@
 # 功能描述: 深度修剪不必要依赖、快速构建的独立受限令牌沙箱工程配置
 # 优化重点:
 #   1. 剥离无用宏依赖: 仅引入沙箱内核执行所需的绝对最小依赖集；
-#   2. 启用跨模块死代码消除: LTO + Strip 确保生成物维持在 ~2MB 极小体积；
-#   3. 消除编译冗余: 避免触发上层 OpenTelemetry 遥测网络栈与全量协议宏。
+#   2. 跨模块死代码消除: 搭配构建工作流环境变量实现全系统 LTO + Strip；
+#   3. 消除编译冗余: 仅对接官方底层沙箱与协议组件，彻底阻断 OpenTelemetry 遥测与大型数据模型。
 # ==============================================================================
 
 [package]
 name = "codex-mini-sandbox"
 version = "0.1.0"
 edition = "2021"
-authors = ["Local Sandbox Agent Team"]
+authors = ["Codex Sandbox Agent Team"]
 description = "Lean, Production-Grade 100% Official-Parity Windows Native Sandbox Runner"
 
 [dependencies]
-# 统一错误上下文包装
+# 统一错误上下文包装库
 anyhow = "1.0"
 
-# 官方对齐的每日滚动文件日志与时间戳格式化
+# 官方对齐的时间戳格式化（仅开启最小必要 feature）
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
-# 工业级命令行参数解析库
+# 工业级命令行参数解析库（严格对齐官方 clap 规范）
 clap = { version = "4.4", features = ["derive"] }
 
-# Windows 物理绝对路径规范化（消除短路径名安全盲区）
+# Windows 物理绝对路径规范化（消除短路径名 8.3 格式与符号链接安全盲区）
 dunce = "1.0"
 
 # 序列化支持
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# 异步系统运行时与信号监听
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "signal"] }
+# 异步系统运行时（严格裁剪为最小运行模块）
+tokio = { version = "1.35", default-features = false, features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 # 官方配置文件解析支持
 toml = "0.8"
@@ -40,7 +40,7 @@ toml = "0.8"
 # 系统可执行文件快速探测
 which = "6.0"
 
-# 直接对接 Codex 仓库官方提供的安全沙箱核心组件
+# 直接对接 Codex 仓库官方提供的安全沙箱核心组件与路径工具
 codex-windows-sandbox = { path = "../windows-sandbox-rs" }
 codex-protocol = { path = "../protocol" }
 codex-utils-absolute-path = { path = "../utils/absolute-path" }
@@ -57,11 +57,3 @@ features = [
     "Win32_System_Console",
 ]
 workspace = true
-
-# 生产级构建优化指令
-[profile.release]
-opt-level = 3          # 最高级别编译器优化
-lto = true             # 开启跨 Crate 链接时深度优化 (LTO)
-codegen-units = 1      # 缩减生成单元以最大化内联优化效果
-panic = "abort"        # 遇恐慌直接中止，精简运行时展开表
-strip = true           # 剥离全部调试符号，压榨最终产物体积至极致
