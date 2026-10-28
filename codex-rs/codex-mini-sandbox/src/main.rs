@@ -8,7 +8,7 @@
 //   2. 采用路线 A：Win32 原生 `WriteFile` 原始字节直写，彻底解决控制台 non-UTF-8 报错:
 //      - 彻底绕过 Rust 标准库 `std::io::stderr()` 在控制台模式下的 UTF-8 强行校验；
 //      - 宿主直接向系统标准句柄（控制台/文件/管道）写入子进程管道输出的原始字节流，原汁原味呈现本地中文报错（如“拒绝访问。”）；
-//      - 严格匹配 windows-sys 0.61 的 `*const u8` 缓冲区指针签名，杜绝类型不匹配错误；
+//      - 严格对齐 `mpsc::Receiver<Vec<u8>>` 通道与 `tokio_runtime.block_on` 接收驱动；
 //      - 配备完整的空句柄防御与循环写入保障，100% 兼容文件重定向、管道化和无控制台后台服务；
 //      - 100% 保持官方原版完整的 Ctrl+C 信号取消捕获与 5 秒标准流排空超时（output_drain_timeout）保护。
 //   3. 命令行语法树全平铺与全中文帮助文档:
@@ -46,7 +46,6 @@ use codex_windows_sandbox::{
     WindowsSandboxProxySettingsMode,
     WindowsSandboxSessionRequest,
 };
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -302,15 +301,16 @@ fn raw_win32_write(handle_id: u32, bytes: &[u8]) -> bool {
 
 /// 启动原始字节输出转发器线程（直接绕过 Rust 标准库 stdout/stderr）
 fn spawn_raw_output_forwarder(
+    tokio_runtime: tokio::runtime::Handle,
     handle_id: u32,
-    output_rx: broadcast::Receiver<Vec<u8>>,
+    output_rx: mpsc::Receiver<Vec<u8>>,
 ) -> (std::thread::JoinHandle<()>, oneshot::Receiver<()>) {
     let (done_tx, done_rx) = oneshot::channel();
 
     let handle = std::thread::spawn(move || {
         let mut output_rx = output_rx;
-        // 阻塞接收管道读出的原始数据分块
-        while let Ok(chunk) = output_rx.blocking_recv() {
+        // 规范通过 tokio_runtime.block_on 阻塞接收管道读出的原始数据分块
+        while let Some(chunk) = tokio_runtime.block_on(output_rx.recv()) {
             #[cfg(windows)]
             {
                 // 优先直接调用 Win32 原生 WriteFile 写入控制台句柄，绕过 Rust UTF-8 检查
@@ -369,6 +369,7 @@ where
 /// 工业级原生 Stdio 转发器（100% 对齐官方生命周期，且具备原生原始字节直写能力）
 async fn forward_sandbox_session_stdio_raw(spawned: SpawnedProcess) -> i32 {
     let session = Arc::new(spawned.session);
+    let tokio_runtime = tokio::runtime::Handle::current();
     let output_drain_timeout = Duration::from_secs(5); // 严格对齐官方 5 秒输出排空保护
 
     let (stdin_eof_tx, stdin_eof_rx) = oneshot::channel();
@@ -378,24 +379,28 @@ async fn forward_sandbox_session_stdio_raw(spawned: SpawnedProcess) -> i32 {
         stdin_eof_tx,
     ));
 
-    // 使用 Win32 原生句柄转发 stdout (句柄 7) 与 stderr (句柄 8)
+    // 使用 Win32 原生句柄对称转发 stdout 与 stderr
     #[cfg(windows)]
-    let (stdout_forwarder, stdout_forwarder_done_rx) =
-        spawn_raw_output_forwarder(STD_OUTPUT_HANDLE, spawned.stdout_rx);
+    let (stdout_forwarder, stdout_forwarder_done_rx) = spawn_raw_output_forwarder(
+        tokio_runtime.clone(),
+        STD_OUTPUT_HANDLE,
+        spawned.stdout_rx,
+    );
     #[cfg(not(windows))]
     let (stdout_forwarder, stdout_forwarder_done_rx) =
-        spawn_raw_output_forwarder(1, spawned.stdout_rx);
+        spawn_raw_output_forwarder(tokio_runtime.clone(), 1, spawned.stdout_rx);
     drop(stdout_forwarder);
 
-    let (stderr_forwarder_done_rx, _stderr_forwarder) = if let Some(stderr_rx) = spawned.stderr_rx {
-        #[cfg(windows)]
-        let (handle, done_rx) = spawn_raw_output_forwarder(STD_ERROR_HANDLE, stderr_rx);
-        #[cfg(not(windows))]
-        let (handle, done_rx) = spawn_raw_output_forwarder(2, stderr_rx);
-        (Some(done_rx), Some(handle))
-    } else {
-        (None, None)
-    };
+    #[cfg(windows)]
+    let (stderr_forwarder, stderr_forwarder_done_rx) = spawn_raw_output_forwarder(
+        tokio_runtime.clone(),
+        STD_ERROR_HANDLE,
+        spawned.stderr_rx,
+    );
+    #[cfg(not(windows))]
+    let (stderr_forwarder, stderr_forwarder_done_rx) =
+        spawn_raw_output_forwarder(tokio_runtime.clone(), 2, spawned.stderr_rx);
+    drop(stderr_forwarder);
 
     let stdin_close_task = tokio::spawn({
         let session = Arc::clone(&session);
@@ -421,9 +426,7 @@ async fn forward_sandbox_session_stdio_raw(spawned: SpawnedProcess) -> i32 {
     // 等待后台输出线程彻底将最后的错误排空到屏幕
     let _ = tokio::time::timeout(output_drain_timeout, async {
         let _ = stdout_forwarder_done_rx.await;
-        if let Some(stderr_rx) = stderr_forwarder_done_rx {
-            let _ = stderr_rx.await;
-        }
+        let _ = stderr_forwarder_done_rx.await;
     })
     .await;
 
