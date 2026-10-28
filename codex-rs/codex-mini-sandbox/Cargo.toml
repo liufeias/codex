@@ -1,10 +1,10 @@
 # ==============================================================================
 # 文件路径: codex-rs/codex-mini-sandbox/Cargo.toml
-# 功能描述: 100% 对齐官方行为的独立 Windows 原生安全沙箱执行器工程清单
+# 功能描述: 100% 官方行为对齐的企业级独立 Windows 原生受限令牌沙箱工程配置
 # 设计哲学:
-#   1. 纯净剥离: 彻底排除 Google V8、WezTerm 等 300MB+ 臃肿模块，保留 100% 原生沙箱能力；
-#   2. 官方原生: 直接对接底层 windows-sandbox-rs 与 protocol crate，内核凭据分毫不差；
-#   3. 工业级优化: 开启 LTO 与符号剥离，体积控制在 ~2MB，冷启动速度 < 2ms。
+#   1. 内核级纯净: 剔除 V8/WezTerm 等 300MB+ 巨型非必要包袱，直接复用底层 Win32 沙箱原语；
+#   2. 官方血统: 直接链接内部 windows-sandbox-rs, protocol 和 utils crate，安全边界绝对一致；
+#   3. 生产优化: 启用全局 LTO 跨模块优化与符号剥离，将二进制体积控制在约 2MB，冷启动耗时 < 2ms。
 # ==============================================================================
 
 [package]
@@ -12,40 +12,53 @@ name = "codex-mini-sandbox"
 version = "0.1.0"
 edition = "2021"
 authors = ["Local Sandbox Agent Team"]
-description = "100% Official-Feature-Parity Windows Native Sandbox Runner for Codex"
+description = "Production-grade, 100% Official-Feature-Parity Windows Native Sandbox Runner for Codex"
 
 [dependencies]
-# 错误上下文包装
+# 统一错误链处理
 anyhow = "1.0"
 
-# 时间戳处理与每日滚动日志格式化（对齐官方 sandbox.YYYY-MM-DD.log）
+# 官方对齐的每日滚动文件日志与时间戳格式化
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
-# 命令行参数解析（支持宽松语法与别名）
+# 工业级高容错命令行参数解析库
 clap = { version = "4.4", features = ["derive"] }
 
-# Windows 长路径与 UNC 规范化工具
+# Windows 物理绝对路径规范化（根除短路径与软链接安全盲区）
 dunce = "1.0"
 
-# 序列化支持
+# 序列化与反序列化组件
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# 异步系统运行时（用于与底层沙箱异步事件和流式 I/O 桥接）
-tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync"] }
+# 异步多任务与控制台 Ctrl+C 信号取消监听
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "signal"] }
 
-# TOML 配置解析器（用于解析 CODEX_HOME/config.toml 中的沙箱模式）
+# 本地 config.toml 配置文件解析组件
 toml = "0.8"
 
-# 直接依赖 Codex 仓库内部的安全沙箱与协议 Crate（保证内核逻辑绝对一致）
+# 直接对接 Codex 仓库官方提供的安全沙箱核心组件（零逻辑衰减）
 codex-windows-sandbox = { path = "../windows-sandbox-rs" }
 codex-protocol = { path = "../protocol" }
 codex-utils-absolute-path = { path = "../utils/absolute-path" }
 
-# 生产级构建优化配置
+# Windows 原生安全对象与访问控制列表 Win32 接口调用
+[target.'cfg(windows)'.dependencies.windows-sys]
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+]
+workspace = true
+
+# 生产级构建优化指令
 [profile.release]
 opt-level = 3          # 最高级别编译器优化
-lto = true             # 开启跨 Crate 链接时优化 (LTO)
-codegen-units = 1      # 缩减生成单元以最大化内联效果
-panic = "abort"        # 遇恐慌直接中止，精简展开表
-strip = true           # 剥离所有调试符号，压榨产物体积
+lto = true             # 开启跨 Crate 链接时深度优化 (Link-Time Optimization)
+codegen-units = 1      # 缩减生成单元以最大化内联优化效果
+panic = "abort"        # 遇恐慌直接中止，精简运行时展开表
+strip = true           # 剥离全部调试符号，压榨最终产物体积至极致
