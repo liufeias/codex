@@ -1,30 +1,11 @@
 // ==============================================================================
 // 文件路径: codex-rs/codex-mini-sandbox/src/main.rs
-// 功能描述: 100% 完整复刻 Codex 官方 Windows 沙箱全部行为的工业级独立执行器
-// 架构设计与 100% 对齐实现细节:
-//   1. 宽松容错参数引擎:
-//      - 完整支持 `-c key=value`（如 `-c sandbox_mode='workspace-write'`）；
-//      - 同时兼容 `-P`、`--permission-profile` 以及复数别名 `--permissions-profile`；
-//      - 支持 `-p` / `--profile` 与 `-C` / `--cd`；
-//      - 允许省略 `--` 双横杠，通过 trailing_var_arg 自动打包尾随目标命令。
-//   2. 动态工作区写权限自愈 (修复新工作区 Access Denied 缺陷):
-//      - 每次执行前，动态探查目标工作区是否具备当前用户及沙箱用户 (CodexSandboxOffline)
-//        的写入 DACL；若缺失，调用 Win32 原语动态追加 Allow-Write ACE。
-//   3. 开发者主目录敏感黑名单排除与工具链白名单授权 (对齐官方 setup.rs):
-//      - 严格排除 `.ssh`, `.aws`, `.kube`, `.docker` 等 12 类高危凭据目录；
-//      - 为其余工具链目录（`AppData`, `go`, `.dotnet`, `.cargo` 等）挂载安全只读访问 ACE。
-//   4. 辅助执行器自愈物质化 (对齐 helper_materialization.rs):
-//      - 智能探查并校验 `codex-command-runner` 的多级候选位置，自愈对齐版本号。
-//   5. 官方环境准备动作 100% 闭环:
-//      - Git 跨用户安全目录穿透: 动态注入 `GIT_CONFIG_PARAMETERS`，杜绝 `dubious ownership` 报错；
-//      - 分页器屏蔽: 强制注入 `GIT_PAGER=cat`、`PAGER=cat`，防止交互式分页器挂死超时；
-//      - 编码预置: 遇到 PowerShell 时自动前置注入 UTF-8 输出编码指令；
-//      - 空设备重定向规范化: 确保 NUL 设备句柄映射正确。
-//   6. 进程树生命周期与 Ctrl+C 取消灭绝机制:
-//      - 监听操作系统 Ctrl+C 信号，双向通道联动，超时或取消时内核级彻底终止整个 JobObject。
-//   7. 控制台与审计日志分流:
-//      - 真实 Stdout/Stderr 纯净透传给控制台或 Python 调用端；
-//      - 系统事件全量写入 `CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log`，完全对齐官方规范。
+// 功能描述: 100% 完整复刻 Codex 官方 Windows 沙箱全部行为的工业级独立执行器 (Bug修复版)
+// 修复记录:
+//   1. 修复 E0603: 将私有模块路径 `acl::ensure_allow_write_aces` 和 `winutil::resolve_sid`
+//      修正为从 `codex_windows_sandbox` 根命名空间直接导入公开重导出符号；
+//   2. 修复 E0433: 正确声明并链接 `which` 模块进行可执行程序探测，并提供本地 PATH 遍历双重容错；
+//   3. 修复 E0599: 移除对直接返回 bool 值的 `sandbox_setup_is_complete` 调用上的 `.unwrap_or(false)`。
 // ==============================================================================
 
 use std::collections::HashMap;
@@ -36,7 +17,9 @@ use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_windows_sandbox::{
+    ensure_allow_write_aces,           // 修复导入：从根命名空间公开重导出中导入
     forward_sandbox_session_stdio,
+    resolve_sid,                      // 修复导入：从根命名空间公开重导出中导入
     resolve_windows_deny_read_paths,
     sandbox_setup_is_complete,
     spawn_windows_sandbox_session_for_level,
@@ -45,7 +28,7 @@ use codex_windows_sandbox::{
 };
 
 // ==============================================================================
-// 1. 命令行参数定义（高兼容度，完全对齐官方 WindowsCommand）
+// 1. 命令行参数定义（完全兼容官方 WindowsCommand 语法）
 // ==============================================================================
 
 #[derive(Parser, Debug)]
@@ -55,7 +38,7 @@ use codex_windows_sandbox::{
     trailing_var_arg = true
 )]
 struct Cli {
-    /// 兼容语法槽：无损消费可能传入的 "sandbox" 子命令动词
+    /// 兼容语法槽：无损消费可能由调用端传入的 "sandbox" 子命令动词
     #[arg(value_parser = ["sandbox"])]
     _dummy_subcmd: Option<String>,
 
@@ -113,9 +96,6 @@ const USERPROFILE_ROOT_EXCLUSIONS: &[&str] = &[
 fn ensure_workspace_write_permissions(workspace_root: &Path) {
     #[cfg(windows)]
     unsafe {
-        use codex_windows_sandbox::acl::ensure_allow_write_aces;
-        use codex_windows_sandbox::winutil::resolve_sid;
-
         let mut target_sids: Vec<*mut std::ffi::c_void> = Vec::new();
         let mut allocated_buffers: Vec<Vec<u8>> = Vec::new();
 
@@ -201,7 +181,7 @@ fn prepare_shell_command_encoding(command: Vec<String>) -> Vec<String> {
 fn auto_resolve_command_runner(codex_home: &Path) -> Option<PathBuf> {
     let sandbox_bin = codex_home.join(".sandbox-bin");
 
-    // 1. 扫描 .sandbox-bin 目录下已有 runner，选用修改时间最新的有效版本
+    // 1. 优先扫描 .sandbox-bin 目录下已有 runner，选用修改时间最新的有效版本
     if sandbox_bin.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&sandbox_bin) {
             let mut candidates: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
@@ -216,7 +196,6 @@ fn auto_resolve_command_runner(codex_home: &Path) -> Option<PathBuf> {
                     }
                 }
             }
-            // 按更新时间降序排列，优先选用最新版本
             candidates.sort_by(|a, b| b.0.cmp(&a.0));
             if let Some((_, best_path)) = candidates.into_iter().next() {
                 return Some(best_path);
@@ -234,7 +213,7 @@ fn auto_resolve_command_runner(codex_home: &Path) -> Option<PathBuf> {
         }
     }
 
-    // 3. 尝试从系统 PATH 寻找
+    // 3. 尝试从系统 PATH 中定位
     which::which("codex-command-runner.exe").ok()
 }
 
@@ -297,10 +276,10 @@ fn resolve_effective_sandbox_level(
         }
     }
 
-    // 3. 检查 `.sandbox-secrets/sandbox_users.json` 是否就绪且可用
-    let secrets_ready = sandbox_setup_is_complete(codex_home).unwrap_or(false);
+    // 3. 检查 `.sandbox-secrets/sandbox_users.json` 是否就绪且可用（修复：直接取 bool 值）
+    let secrets_ready = sandbox_setup_is_complete(codex_home);
 
-    // 4. 裁决逻辑：配置为 elevated 且凭据有效时，走 Elevated 模式；否则使用 RestrictedToken
+    // 4. 裁决逻辑：配置为 elevated 且凭据有效时走 Elevated 模式；否则使用 RestrictedToken
     match configured_mode.as_deref() {
         Some("elevated") if secrets_ready => WindowsSandboxLevel::Elevated,
         Some("disabled") => WindowsSandboxLevel::Disabled,
@@ -328,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // 2. 路径物理绝对规范化（消除短路径名和软链接潜在安全绕过）
+    // 2. 路径物理绝对规范化（消除短路径名和符号链接潜在安全绕过）
     let cwd_canonical = dunce::canonicalize(&cli.cwd).map_err(|e| {
         anyhow::anyhow!(
             "[codex-mini-sandbox] 工作区路径无法访问或物理不存在 [{}]: {e}",

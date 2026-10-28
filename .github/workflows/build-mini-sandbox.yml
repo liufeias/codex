@@ -1,16 +1,24 @@
 # ==============================================================================
-# 工作流名称: 构建 100% 官方行为对齐的 Codex 独立微型沙箱
-# 触发策略: 仅允许手动在网页控制台触发 (workflow_dispatch)
-# 运行环境: Windows Server 最新宿主环境 (windows-latest)
+# 工作流名称: 编译构建 Codex 原生独立微型安全沙箱 (codex-mini-sandbox)
+# 触发策略: 仅限手动触发 (workflow_dispatch)，彻底杜绝任何自动触发消耗云端算力
+# 运行环境: Windows Server 最新镜像 (windows-latest)
+# 设计哲学:
+#   1. 纯粹解耦: 移除所有在 CI 脚本中硬编码生成业务代码的冗余逻辑，完全依赖仓库源码构建；
+#   2. 自动定位: 智能识别 Rust 工作区在仓库根目录还是 codex-rs 子目录下；
+#   3. 自动挂载: 自动校验并确保根工作区 Cargo.toml 包含 codex-mini-sandbox 成员声明；
+#   4. 安全交付: 构建完毕后自动计算 SHA-256 哈希完整性校验码，并通过 Artifacts 安全发布。
 # ==============================================================================
 
-name: Build Codex Mini Sandbox (100% Parity)
+name: Build Codex Mini Sandbox
 
+# ------------------------------------------------------------------------------
+# 触发器配置：仅限维护人员在 GitHub 网页控制台手动点击触发
+# ------------------------------------------------------------------------------
 on:
   workflow_dispatch:
     inputs:
       build_profile:
-        description: '选择编译配置 (Build Profile)'
+        description: '选择编译配置模式 (Build Profile)'
         required: true
         default: 'release'
         type: choice
@@ -18,92 +26,101 @@ on:
           - release
           - debug
 
+# 默认权限策略：最小特权，仅允许读取仓库源码
 permissions:
   contents: read
 
+# ------------------------------------------------------------------------------
+# 构建任务主体定义
+# ------------------------------------------------------------------------------
 jobs:
   build-windows-sandbox:
-    name: 编译生产级 Windows 原生微型安全沙箱
+    name: 编译 Windows 原生轻量安全沙箱 (x86_64-pc-windows-msvc)
     runs-on: windows-latest
 
     steps:
-      # 1. 检出仓库源码
-      - name: 检出当前代码仓库 (Checkout Repository)
+      # 1. 检出当前代码仓库中的全部源码
+      - name: 检出当前仓库源码 (Checkout Repository)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 2. 配置 Rust 稳定版工具链
+      # 2. 安装并配置官方 Rust 稳定版工具链及 MSVC 编译目标
       - name: 配置 Rust 官方编译环境 (Setup Rust Toolchain)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      # 3. 启用 Cargo 构建缓存提升构建效率
+      # 3. 启用官方 Cargo 依赖缓存以大幅加速依赖下载与增量编译
       - name: 配置 Cargo 依赖缓存 (Cargo Cache)
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: "codex-mini-sandbox-cache"
 
-      # 4. 探查并确保最新 100% 复刻版源码已就位
-      - name: 探查并挂载 codex-mini-sandbox 源码
+      # 4. 工作区与项目挂载自动探查（纯净环境自适应）
+      - name: 探查并确保工作区清单正确包含 codex-mini-sandbox
         shell: pwsh
         run: |
-          Write-Host "[1/3] 探查 Codex Rust 工作区根目录位置..."
+          Write-Host "[1/2] 探查 Rust 工作区根目录位置..."
+          # 智能定位 Cargo.toml 所在的工作区根路径（优先使用 codex-rs，不存在则使用当前根目录）
           $rustRoot = if (Test-Path "codex-rs/Cargo.toml") { "codex-rs" } else { "." }
-          Write-Host "   -> 锁定 Rust 工作区路径: $rustRoot"
+          Write-Host "   -> 锁定 Rust 编译工作区路径: $rustRoot"
           echo "RUST_ROOT=$rustRoot" >> $env:GITHUB_ENV
 
-          $targetCrateDir = "$rustRoot/codex-mini-sandbox"
-          $targetCargoToml = "$targetCrateDir/Cargo.toml"
-          $targetMainRs = "$targetCrateDir/src/main.rs"
+          # 检查仓库中是否存在 codex-mini-sandbox 工程目录
+          $targetDir = "$rustRoot/codex-mini-sandbox"
+          if (-not (Test-Path "$targetDir/Cargo.toml") -or -not (Test-Path "$targetDir/src/main.rs")) {
+              Write-Error "❌ 错误: 未在仓库中找到 $targetDir 目录或源码文件！请确保已经将 codex-mini-sandbox 提交到 Git 仓库。"
+              exit 1
+          }
 
-          # 确保目录存在
-          New-Item -ItemType Directory -Force -Path "$targetCrateDir/src" | Out-Null
-
-          # 确保根目录 Cargo.toml 中的 workspace.members 包含 codex-mini-sandbox
-          Write-Host "[2/3] 检查工作区清单 members 配置..."
+          Write-Host "[2/2] 检查根工作区清单 Cargo.toml 是否已登记 members..."
           $rootTomlPath = "$rustRoot/Cargo.toml"
           $rootTomlContent = Get-Content -Raw -Path $rootTomlPath
+          
+          # 如果工作区 members 列表中尚未加入 codex-mini-sandbox，自动动态追加确保编译不报错
           if ($rootTomlContent -notmatch "codex-mini-sandbox") {
-              Write-Host "   -> 向 $rootTomlPath 追加成员: codex-mini-sandbox"
+              Write-Host "   -> 工作区清单未发现声明，自动向 $rootTomlPath 追加成员声明..."
               $updatedToml = $rootTomlContent -replace 'members\s*=\s*\[', "members = [`n    `"codex-mini-sandbox`","
               Set-Content -Path $rootTomlPath -Value $updatedToml -Encoding utf8
           }
-          Write-Host "✅ 依赖关系挂载完毕！"
+          Write-Host "✅ 工作区环境就绪！"
 
-      # 5. 执行 Cargo 编译构建
+      # 5. 执行 Cargo 编译构建命令
       - name: 执行 Cargo 编译 (Build codex-mini-sandbox)
         shell: pwsh
         run: |
           cd $env:RUST_ROOT
           $buildProfile = "${{ github.event.inputs.build_profile }}"
-          Write-Host "🚀 开始编译目标: codex-mini-sandbox (模式: $buildProfile)..."
+          Write-Host "🚀 开始执行编译: codex-mini-sandbox (模式: $buildProfile)..."
 
           $cargoArgs = @("build", "-p", "codex-mini-sandbox")
           if ($buildProfile -eq "release") {
               $cargoArgs += "--release"
           }
 
+          # 启动编译器
           & cargo @cargoArgs
           if ($LASTEXITCODE -ne 0) {
-              Write-Error "❌ 编译失败，退出码: $LASTEXITCODE"
+              Write-Error "❌ 编译过程中发生错误，退出码: $LASTEXITCODE"
               exit $LASTEXITCODE
           }
           Write-Host "✅ 编译构建成功！"
 
-      # 6. 产物提取与 SHA256 计算
+      # 6. 提取编译产物、生成 SHA-256 哈希校验码
       - name: 收集与审计编译产物 (Collect Artifacts & Checksum)
         shell: pwsh
         run: |
           $buildProfile = "${{ github.event.inputs.build_profile }}"
-          $possiblePaths = @(
+          
+          # 探查编译产物的生成路径（兼容不同的 Cargo Target 输出拓扑）
+          $candidatePaths = @(
               "$env:RUST_ROOT/target/$buildProfile/codex-mini-sandbox.exe",
               "target/$buildProfile/codex-mini-sandbox.exe"
           )
 
           $exePath = $null
-          foreach ($path in $possiblePaths) {
+          foreach ($path in $candidatePaths) {
               if (Test-Path $path) {
                   $exePath = Resolve-Path $path
                   break
@@ -111,26 +128,29 @@ jobs:
           }
 
           if (-not $exePath) {
-              Write-Error "❌ 未找到构建产物 codex-mini-sandbox.exe！"
+              Write-Error "❌ 构建失败：未能找到生成的目标二进制文件 codex-mini-sandbox.exe！"
               exit 1
           }
 
+          # 建立独立的归档发布暂存目录
           New-Item -ItemType Directory -Force -Path "dist" | Out-Null
           Copy-Item -Path $exePath -Destination "dist/codex-mini-sandbox.exe" -Force
 
+          # 统计可执行文件大小
           $fileItem = Get-Item "dist/codex-mini-sandbox.exe"
           $sizeMb = [math]::Round($fileItem.Length / 1MB, 2)
-          Write-Host "📦 最终产物路径: $($fileItem.FullName)"
-          Write-Host "📏 最终可执行文件体积: $sizeMb MB"
+          Write-Host "📦 编译产物定位成功: $($fileItem.FullName)"
+          Write-Host "📏 可执行文件体积: $sizeMb MB"
 
+          # 计算 SHA-256 哈希完整性指纹
           $hash = (Get-FileHash -Path "dist/codex-mini-sandbox.exe" -Algorithm SHA256).Hash
           Set-Content -Path "dist/codex-mini-sandbox.exe.sha256" -Value "$hash *codex-mini-sandbox.exe"
 
           Write-Host "=========================================================="
-          Write-Host "   SHA256 校验和: $hash"
+          Write-Host "   SHA-256 校验指纹: $hash"
           Write-Host "=========================================================="
 
-      # 7. 上传 Artifacts 供一键下载
+      # 7. 上传编译产物到 GitHub Actions 工件库供一键下载
       - name: 上传构建工件 (Upload Artifact)
         uses: actions/upload-artifact@v4
         with:

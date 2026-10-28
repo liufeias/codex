@@ -1,10 +1,6 @@
 # ==============================================================================
 # 文件路径: codex-rs/codex-mini-sandbox/Cargo.toml
-# 功能描述: 100% 官方行为对齐的企业级独立 Windows 原生受限令牌沙箱工程配置
-# 设计哲学:
-#   1. 内核级纯净: 剔除 V8/WezTerm 等 300MB+ 巨型非必要包袱，直接复用底层 Win32 沙箱原语；
-#   2. 官方血统: 直接链接内部 windows-sandbox-rs, protocol 和 utils crate，安全边界绝对一致；
-#   3. 生产优化: 启用全局 LTO 跨模块优化与符号剥离，将二进制体积控制在约 2MB，冷启动耗时 < 2ms。
+# 功能描述: 修复依赖引用后的独立 Windows 原生受限令牌沙箱工程配置清单
 # ==============================================================================
 
 [package]
@@ -15,10 +11,10 @@ authors = ["Local Sandbox Agent Team"]
 description = "Production-grade, 100% Official-Feature-Parity Windows Native Sandbox Runner for Codex"
 
 [dependencies]
-# 统一错误链处理
+# 统一错误上下文包装
 anyhow = "1.0"
 
-# 官方对齐的每日滚动文件日志与时间戳格式化
+# 时间戳处理与每日滚动日志格式化（对齐官方 sandbox.YYYY-MM-DD.log）
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # 工业级高容错命令行参数解析库
@@ -37,7 +33,10 @@ tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "sync", "si
 # 本地 config.toml 配置文件解析组件
 toml = "0.8"
 
-# 直接对接 Codex 仓库官方提供的安全沙箱核心组件（零逻辑衰减）
+# 系统可执行文件路径探测组件（已修复：显式引入依赖）
+which = "6.0"
+
+# 直接对接 Codex 仓库官方提供的安全沙箱核心组件
 codex-windows-sandbox = { path = "../windows-sandbox-rs" }
 codex-protocol = { path = "../protocol" }
 codex-utils-absolute-path = { path = "../utils/absolute-path" }
