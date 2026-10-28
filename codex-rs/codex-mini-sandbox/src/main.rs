@@ -8,6 +8,7 @@
 //   2. 采用路线 A：Win32 原生 `WriteFile` 原始字节直写，彻底解决控制台 non-UTF-8 报错:
 //      - 彻底绕过 Rust 标准库 `std::io::stderr()` 在控制台模式下的 UTF-8 强行校验；
 //      - 宿主直接向系统标准句柄（控制台/文件/管道）写入子进程管道输出的原始字节流，原汁原味呈现本地中文报错（如“拒绝访问。”）；
+//      - 严格匹配 windows-sys 0.61 的 `*const u8` 缓冲区指针签名，杜绝类型不匹配错误；
 //      - 配备完整的空句柄防御与循环写入保障，100% 兼容文件重定向、管道化和无控制台后台服务；
 //      - 100% 保持官方原版完整的 Ctrl+C 信号取消捕获与 5 秒标准流排空超时（output_drain_timeout）保护。
 //   3. 命令行语法树全平铺与全中文帮助文档:
@@ -280,9 +281,10 @@ fn raw_win32_write(handle_id: u32, bytes: &[u8]) -> bool {
             let chunk_len = chunk.len().min(u32::MAX as usize) as u32;
             let mut bytes_written: u32 = 0;
 
+            // 注意：windows-sys 0.61 中 lpbuffer 严格要求 `*const u8`
             let success = WriteFile(
                 handle,
-                chunk.as_ptr() as *const std::ffi::c_void,
+                chunk.as_ptr(),
                 chunk_len,
                 &mut bytes_written,
                 std::ptr::null_mut(),

@@ -2,7 +2,7 @@
 # 文件路径: codex-rs/codex-mini-sandbox/Cargo.toml
 # 功能描述: 深度修剪不必要依赖、快速构建的独立受限令牌沙箱工程配置
 # 优化重点:
-#   1. 剥离无用宏依赖: 仅引入沙箱内核执行所需的绝对最小依赖集；
+#   1. 补齐 SpawnedProcess 运行时进程抽象所需依赖: 对接工作区公共 utils/pty；
 #   2. 配合 MSVC 链接器参数: 在编译期生成可细粒度打散的 COMDAT 目标文件；
 #   3. 精准依赖对接: 直接对接 Codex 仓库官方底层沙箱组件 windows-sandbox-rs。
 # ==============================================================================
@@ -40,10 +40,11 @@ toml = "0.8"
 # 系统可执行文件快速探测
 which = "6.0"
 
-# 直接对接 Codex 仓库官方提供的安全沙箱核心组件与路径工具
+# 直接对接 Codex 仓库官方提供的安全沙箱核心组件、进程抽象与路径工具
 codex-windows-sandbox = { path = "../windows-sandbox-rs" }
 codex-protocol = { path = "../protocol" }
 codex-utils-absolute-path = { path = "../utils/absolute-path" }
+codex-utils-pty = { path = "../utils/pty" }
 
 # Windows 原生安全对象与访问控制列表 Win32 接口
 [target.'cfg(windows)'.dependencies.windows-sys]
