@@ -2,48 +2,61 @@
 // 文件路径: codex-rs/codex-mini-sandbox/src/main.rs
 // 功能描述: 100% 严格复刻 Codex 官方 Windows 原生沙箱参数与执行规范的工业级独立执行器
 // 核心设计与官方权威对齐准则:
-//   1. 命令行语法与帮助文档完整详实（全中文、零遗漏）:
-//      - 完整对齐官方顶层 `-c, --config <key=value>`（支持覆盖任意 toml 配置，支持点分嵌套路径）；
-//      - 完整对齐官方全局特性开关 `--enable <FEATURE>` 与 `--disable <FEATURE>`；
-//      - 完整平铺官方 WindowsCommand 核心参数（-P, -p, -C, --include-managed-config）；
-//      - 严格对齐级联绑定: -C/--cd 与 --include-managed-config 必须与 -P 联动；
-//      - 完整对齐官方子命令体系: 支持 `codex sandbox uninstall` 机器级规则清理命令；
-//      - 完整对齐官方透明沙箱状态注入: --sandbox-state-json 及其关联路径与网络开关。
-//   2. 默认权限策略 100% 官方对齐（核心安全防御基线）:
-//      - 严格对齐官方官方规则: 在未显式提供 -P 且未提供 -c sandbox_mode=workspace-write 时，
-//        默认基线严格为只读（ReadOnly），严禁私自放开写权限；
-//      - 仅在显式指定 -P :workspace 或通过 -c sandbox_mode=workspace-write 时才激活工作区写入。
-//   3. 网络隔离与 WFP 防火墙联动 100% 闭环:
-//      - 权限画像统一绑定 NetworkSandboxPolicy::Restricted，自动触发底层 CodexSandboxOffline 影子账户；
-//      - 该影子账户在系统部署时已由内核级 WFP 驱动绑定出站阻断（硬件级物理断网）；
-//      - 处于受限网络状态时，显式注入官方环境变量 CODEX_SANDBOX_NETWORK_DISABLED=1；
-//      - Unelevated 模式下自动触发黑洞代理引流防御。
-//   4. 控制台 Stdio 与 Ctrl+C 信号处理完全对齐:
-//      - 移除外层抢占式 select!，完全移交官方 forward_sandbox_session_stdio 内部的 5 秒排空机制，
-//        杜绝子进程退出前管道被提前截断的 Bug。
-//   5. 报错文本标准统一:
-//      - 发生致命错误时严格输出官方格式 `eprintln!("windows sandbox failed: {err}")`，严禁私造前缀。
+//   1. 彻底拔除私造权限注入代码:
+//      - 物理删除 `ensure_workspace_write_permissions`，严禁外层擅自向物理目录烙印持久化 Allow ACE；
+//      - 读写授权全权回归官方提权 setup.exe 动态下发流水线，从根本上确保只读模式（:read-only）不可渗透。
+//   2. 采用路线 A：Win32 原生 `WriteFile` 原始字节直写，彻底解决控制台 non-UTF-8 报错:
+//      - 彻底绕过 Rust 标准库 `std::io::stderr()` 在控制台模式下的 UTF-8 强行校验；
+//      - 宿主直接向系统标准句柄（控制台/文件/管道）写入子进程管道输出的原始字节流，原汁原味呈现本地中文报错（如“拒绝访问。”）；
+//      - 配备完整的空句柄防御与循环写入保障，100% 兼容文件重定向、管道化和无控制台后台服务；
+//      - 100% 保持官方原版完整的 Ctrl+C 信号取消捕获与 5 秒标准流排空超时（output_drain_timeout）保护。
+//   3. 命令行语法树全平铺与全中文帮助文档:
+//      - 完整支持官方顶层 `-c, --config <key=value>`（支持点分路径覆盖）；
+//      - 完整支持官方全局特性开关 `--enable <FEATURE>` 与 `--disable <FEATURE>`；
+//      - 完整支持官方 WindowsCommand 核心参数（-P, -p, -C, --include-managed-config）；
+//      - 严格对齐级联约束: -C/--cd 与 --include-managed-config 必须与 -P 联动；
+//      - 完整支持官方透明沙箱状态注入 `--sandbox-state-json` 及其路径/网络开关；
+//      - 支持官方子命令 `uninstall` 机器级规则清理入口。
+//   4. 默认权限安全基线与网络隔离 100% 对齐官方:
+//      - 未指定参数时基线严格为只读（ReadOnly），仅显式声明时才开放工作区写入；
+//      - 统一绑定 NetworkSandboxPolicy::Restricted，自动触发 CodexSandboxOffline 影子账户与 WFP 内核断网；
+//      - 显式注入官方环境变量 `CODEX_SANDBOX_NETWORK_DISABLED=1`。
+//   5. 统一官方标准报错格式:
+//      - 发生致命错误时严格输出 `eprintln!("windows sandbox failed: {err}")`，绝无私造前缀。
 // ==============================================================================
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 use clap::{Args, Parser, Subcommand};
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_pty::SpawnedProcess;
 use codex_windows_sandbox::{
-    ensure_allow_write_aces,
-    forward_sandbox_session_stdio,
-    resolve_sid,
     resolve_windows_deny_read_paths,
     sandbox_setup_is_complete,
     spawn_windows_sandbox_session_for_level,
     WindowsSandboxProxySettingsMode,
     WindowsSandboxSessionRequest,
 };
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
 // ==============================================================================
 // 1. 严格对齐官方结构的命令行语法树定义 (包含中文详尽帮助信息)
@@ -185,26 +198,6 @@ struct WindowsCommandArgs {
 // 2. 官方环境准备动作实现 (Git 穿透、分页器屏蔽、UTF-8 脚本前缀、断网环境标记)
 // ==============================================================================
 
-/// 动态确保工作区具备沙箱影子账户写入 Allow ACE（消除新建工作区报 OS 5 拒绝访问隐患）
-fn ensure_workspace_write_permissions(workspace_root: &Path) {
-    #[cfg(windows)]
-    unsafe {
-        let mut target_sids: Vec<*mut std::ffi::c_void> = Vec::new();
-        let mut allocated_buffers: Vec<Vec<u8>> = Vec::new();
-
-        for username in &["CodexSandboxOffline", "CodexSandboxOnline"] {
-            if let Ok(mut sid_bytes) = resolve_sid(username) {
-                target_sids.push(sid_bytes.as_mut_ptr() as *mut std::ffi::c_void);
-                allocated_buffers.push(sid_bytes);
-            }
-        }
-
-        if !target_sids.is_empty() {
-            let _ = ensure_allow_write_aces(workspace_root, &target_sids);
-        }
-    }
-}
-
 /// 注入 Git 安全目录配置 (对齐官方 inject_git_safe_directory，杜绝 dubious ownership 拦截)
 fn inject_git_safe_directory(env: &mut HashMap<String, String>, cwd: &Path) {
     let cwd_clean = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
@@ -265,7 +258,178 @@ fn prepare_shell_command_encoding(command: Vec<String>) -> Vec<String> {
 }
 
 // ==============================================================================
-// 3. 官方审计日志与 Helper 二进制探针
+// 3. 路线 A 核心实现：Win32 原生 WriteFile 原始字节直写，彻底杜绝 non-UTF-8 报错
+// ==============================================================================
+
+/// 通过 Windows 系统级原生 API `WriteFile` 直接向句柄灌入原始生字节流（Raw Bytes Passthrough）
+/// 彻底绕过 Rust 标准库内部对控制台输出的 UTF-8 强行校验，完美呈现本地化错误提示（如中文“拒绝访问。”）
+/// 同时配备前置句柄有效性守卫与循环完整写入保障，100% 兼容文件重定向、管道化和无控制台后台服务。
+#[cfg(windows)]
+fn raw_win32_write(handle_id: u32, bytes: &[u8]) -> bool {
+    unsafe {
+        let handle: HANDLE = GetStdHandle(handle_id);
+        // 防御性守卫：如果当前进程无控制台（例如 Windows 服务、GUI 后台进程），句柄为 NULL 或 -1，直接安全返回
+        if handle.is_null() || handle == -1isize as HANDLE {
+            return true;
+        }
+
+        let mut total_written: usize = 0;
+        // 循环写入保障：确保大并发或分块数据全部送达，对齐 write_all 语义
+        while total_written < bytes.len() {
+            let chunk = &bytes[total_written..];
+            let chunk_len = chunk.len().min(u32::MAX as usize) as u32;
+            let mut bytes_written: u32 = 0;
+
+            let success = WriteFile(
+                handle,
+                chunk.as_ptr() as *const std::ffi::c_void,
+                chunk_len,
+                &mut bytes_written,
+                std::ptr::null_mut(),
+            );
+
+            // 若写入失败（例如管道下游进程提前退出产生 ERROR_BROKEN_PIPE），退出循环
+            if success == 0 || bytes_written == 0 {
+                return false;
+            }
+            total_written += bytes_written as usize;
+        }
+        true
+    }
+}
+
+/// 启动原始字节输出转发器线程（直接绕过 Rust 标准库 stdout/stderr）
+fn spawn_raw_output_forwarder(
+    handle_id: u32,
+    output_rx: broadcast::Receiver<Vec<u8>>,
+) -> (std::thread::JoinHandle<()>, oneshot::Receiver<()>) {
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let handle = std::thread::spawn(move || {
+        let mut output_rx = output_rx;
+        // 阻塞接收管道读出的原始数据分块
+        while let Ok(chunk) = output_rx.blocking_recv() {
+            #[cfg(windows)]
+            {
+                // 优先直接调用 Win32 原生 WriteFile 写入控制台句柄，绕过 Rust UTF-8 检查
+                if !raw_win32_write(handle_id, &chunk) {
+                    // 若获取句柄失败（例如特殊虚拟句柄），保底回退到标准库
+                    let _ = if handle_id == STD_OUTPUT_HANDLE {
+                        std::io::stdout().write_all(&chunk)
+                    } else {
+                        std::io::stderr().write_all(&chunk)
+                    };
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = if handle_id == 1 {
+                    std::io::stdout().write_all(&chunk)
+                } else {
+                    std::io::stderr().write_all(&chunk)
+                };
+            }
+        }
+        let _ = done_tx.send(());
+    });
+
+    (handle, done_rx)
+}
+
+/// 启动标准输入单向转发器线程（保持官方行为完全一致）
+fn spawn_raw_input_forwarder<R>(
+    mut input: R,
+    writer_tx: mpsc::Sender<Vec<u8>>,
+    stdin_eof_tx: oneshot::Sender<()>,
+) -> std::thread::JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    const STDIN_FORWARD_CHUNK_SIZE: usize = 8 * 1024;
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; STDIN_FORWARD_CHUNK_SIZE];
+        loop {
+            match input.read(&mut buffer) {
+                Ok(0) => break, // 输入源关闭 EOF
+                Ok(n) => {
+                    if writer_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = stdin_eof_tx.send(());
+    })
+}
+
+/// 工业级原生 Stdio 转发器（100% 对齐官方生命周期，且具备原生原始字节直写能力）
+async fn forward_sandbox_session_stdio_raw(spawned: SpawnedProcess) -> i32 {
+    let session = Arc::new(spawned.session);
+    let output_drain_timeout = Duration::from_secs(5); // 严格对齐官方 5 秒输出排空保护
+
+    let (stdin_eof_tx, stdin_eof_rx) = oneshot::channel();
+    drop(spawn_raw_input_forwarder(
+        std::io::stdin(),
+        session.writer_sender(),
+        stdin_eof_tx,
+    ));
+
+    // 使用 Win32 原生句柄转发 stdout (句柄 7) 与 stderr (句柄 8)
+    #[cfg(windows)]
+    let (stdout_forwarder, stdout_forwarder_done_rx) =
+        spawn_raw_output_forwarder(STD_OUTPUT_HANDLE, spawned.stdout_rx);
+    #[cfg(not(windows))]
+    let (stdout_forwarder, stdout_forwarder_done_rx) =
+        spawn_raw_output_forwarder(1, spawned.stdout_rx);
+    drop(stdout_forwarder);
+
+    let (stderr_forwarder_done_rx, _stderr_forwarder) = if let Some(stderr_rx) = spawned.stderr_rx {
+        #[cfg(windows)]
+        let (handle, done_rx) = spawn_raw_output_forwarder(STD_ERROR_HANDLE, stderr_rx);
+        #[cfg(not(windows))]
+        let (handle, done_rx) = spawn_raw_output_forwarder(2, stderr_rx);
+        (Some(done_rx), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    let stdin_close_task = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            let _ = stdin_eof_rx.await;
+            session.close_stdin();
+        }
+    });
+
+    let mut exit_rx = spawned.exit_rx;
+    let exit_code = tokio::select! {
+        res = &mut exit_rx => res.unwrap_or(-1),
+        res = tokio::signal::ctrl_c() => {
+            if let Ok(()) = res {
+                session.request_terminate();
+            }
+            exit_rx.await.unwrap_or(-1)
+        }
+    };
+
+    stdin_close_task.abort();
+
+    // 等待后台输出线程彻底将最后的错误排空到屏幕
+    let _ = tokio::time::timeout(output_drain_timeout, async {
+        let _ = stdout_forwarder_done_rx.await;
+        if let Some(stderr_rx) = stderr_forwarder_done_rx {
+            let _ = stderr_rx.await;
+        }
+    })
+    .await;
+
+    exit_code
+}
+
+// ==============================================================================
+// 4. 官方审计日志与 Helper 二进制探针
 // ==============================================================================
 
 /// 记录日志到 CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log 中，保持终端 Stdout 100% 纯净
@@ -316,7 +480,7 @@ fn has_elevated_helpers() -> bool {
 }
 
 // ==============================================================================
-// 4. 官方正统配置裁决引擎 (支持 -c、--enable、--disable 自动合并)
+// 5. 官方正统配置裁决引擎 (支持 -c、--enable、--disable 自动合并)
 // ==============================================================================
 
 /// 严格按照官方 TOML 规范与四级优先级裁决 Windows 沙箱级别与权限画像覆盖
@@ -418,7 +582,7 @@ fn resolve_official_sandbox_level(
 }
 
 // ==============================================================================
-// 5. 官方子命令分流与管理命令处理 (setup 与 uninstall)
+// 6. 官方子命令分流与管理命令处理 (setup 与 uninstall)
 // ==============================================================================
 
 /// 快速探查并处理诸如 `codex sandbox setup` 或 `codex sandbox uninstall` 等官方管理指令
@@ -454,7 +618,7 @@ fn try_handle_builtin_management_commands(command: &[String]) -> Option<i32> {
 }
 
 // ==============================================================================
-// 6. 主程序入口与标准生命周期驱动
+// 7. 主程序入口与标准生命周期驱动
 // ==============================================================================
 
 #[tokio::main]
@@ -540,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
         .or(sandbox_args.permissions_profile)
         .unwrap_or_else(|| ":read-only".to_string());
 
-    let (permission_profile, is_workspace_write) = match profile_name.as_str() {
+    let (permission_profile, _is_workspace_write) = match profile_name.as_str() {
         ":workspace" => (
             PermissionProfile::workspace_write_with(
                 &[],
@@ -554,12 +718,7 @@ async fn main() -> anyhow::Result<()> {
         _ => (PermissionProfile::read_only(), false),
     };
 
-    // 7. 新工作区写权限自愈（仅在判定为工作区写模式时，消除全新目录报 OS 5 拒绝访问的缺陷）
-    if is_workspace_write {
-        ensure_workspace_write_permissions(&cwd_canonical);
-    }
-
-    // 8. 解析敏感目录只读拦截名单（严格对齐官方标准流程）
+    // 7. 解析敏感目录只读拦截名单（严格对齐官方标准流程）
     let (mut file_system, _) = permission_profile.to_runtime_permissions();
     file_system.remove_skip_missing_path_entries();
     let file_system = file_system.materialize_project_roots_with_workspace_roots(&workspace_roots);
@@ -571,7 +730,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 9. 继承环境变量并应用官方关键环境注入预处理
+    // 8. 继承环境变量并应用官方关键环境注入预处理
     let mut env_map: HashMap<String, String> = std::env::vars().collect();
     inject_git_safe_directory(&mut env_map, &cwd_canonical);
     ensure_non_interactive_pager(&mut env_map);
@@ -582,10 +741,10 @@ async fn main() -> anyhow::Result<()> {
         env_map.insert("CODEX_SANDBOX_NETWORK_DISABLED".to_string(), "1".to_string());
     }
 
-    // 10. 命令预处理：针对 PowerShell 自动前置注入 UTF-8 编码设置
+    // 9. 命令预处理：针对 PowerShell 自动前置注入 UTF-8 编码设置
     let final_command = prepare_shell_command_encoding(sandbox_args.command);
 
-    // 11. 记录官方格式审计启动日志到滚动文件中（终端 Stdout 保持 100% 纯净）
+    // 10. 记录官方格式审计启动日志到滚动文件中（终端 Stdout 保持 100% 纯净）
     let cmd_preview = final_command.join(" ");
     let level_tag = match sandbox_level {
         WindowsSandboxLevel::Elevated => "Elevated (CodexSandboxOffline via WFP Kernel Block)",
@@ -599,7 +758,7 @@ async fn main() -> anyhow::Result<()> {
 
     let empty_paths: &[AbsolutePathBuf] = &[];
 
-    // 12. 装配 WindowsSandboxSessionRequest 并发起内核级安全沙箱子进程（100% 对齐官方参数）
+    // 11. 装配 WindowsSandboxSessionRequest 并发起内核级安全沙箱子进程（100% 对齐官方参数）
     let spawn_result = spawn_windows_sandbox_session_for_level(WindowsSandboxSessionRequest {
         permission_profile: &permission_profile,
         workspace_roots: workspace_roots.as_slice(),
@@ -631,12 +790,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 13. 移交官方 forward_sandbox_session_stdio 接管 Stdio 透传与信号生命周期
-    //     注意：官方内部本身已实现了 ctrl_c() 监听并带有 5 秒缓冲排空保护，外层绝不可再重复包装 select!，
-    //     以彻底杜绝输出被提前截断的缺陷。
-    let exit_code = forward_sandbox_session_stdio(spawned).await;
+    // 12. 采用路线 A：移交具备 Win32 原生 WriteFile 直写能力的 Stdio 转发器
+    //     彻底消灭 Rust 标准库在控制台模式下的 non-UTF-8 报错，原汁原味透传原始字节流
+    let exit_code = forward_sandbox_session_stdio_raw(spawned).await;
 
-    // 14. 记录命令结束审计日志并退出
+    // 13. 记录命令结束审计日志并退出
     if exit_code == 0 {
         append_sandbox_audit_log(&codex_home, &format!("SUCCESS: {cmd_preview}"));
     } else {

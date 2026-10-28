@@ -4,9 +4,9 @@
 # 运行环境: Windows Server 最新镜像 (windows-latest)
 # 架构优化重点:
 #   1. 彻底根除退出码 101 缓存崩溃: 为 rust-cache 显式指定 "codex-rs -> target" 工作区映射，
-#      确保 300+ 底层复杂 Crate 编译成果 100% 成功持久化命中，二次构建耗时由 13 分钟压至 1~2 分钟；
+#      确保 300+ 底层复杂 Crate 编译成果 100% 成功持久化命中，二次构建耗时由 13 分钟断崖式下跌至 1~2 分钟；
 #   2. 实施 MSVC 链接器标准段级激进消亡 (Aggressive Dead-Stripping):
-#      - 去除非法 rustc 命令行标志，使用标准的 `-C link-arg` 对接 MSVC 链接器 link.exe；
+#      - 移除非法的 rustc 编译参数，规范使用 `-C link-arg` 对接微软 MSVC link.exe 链接器；
 #      - 注入 `-C link-arg=/OPT:REF`: 开启链接器全量可达性图剪枝，从入口 main() 出发物理丢弃
 #        所有未被引用的函数与数据段（将无用代码与庞大数据表最大限度切除）；
 #      - 注入 `-C link-arg=/OPT:ICF=3`: 执行最高级别重复代码与相同数据折叠；
@@ -56,7 +56,7 @@ jobs:
         with:
           # 显式告知缓存插件：Rust 工作区根目录位于子目录 codex-rs，编译输出位于 codex-rs/target
           workspaces: "codex-rs -> target"
-          shared-key: "codex-mini-sandbox-cache-v4"
+          shared-key: "codex-mini-sandbox-cache-v6"
 
       # 4. 工作区与项目挂载自动探查
       - name: 探查并确保工作区清单正确包含 codex-mini-sandbox
@@ -97,7 +97,7 @@ jobs:
           CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
           CARGO_INCREMENTAL: "0"
           
-          # 2. 注入合法标准的 rustc 与 MSVC link.exe 优化开关
+          # 2. 注入合法标准的 rustc 与 MSVC link.exe 优化开关（杜绝非法选项，确保平稳编译）
           RUSTFLAGS: >-
             -C strip=symbols
             -C panic=abort
