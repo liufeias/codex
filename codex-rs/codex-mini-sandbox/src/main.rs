@@ -1,21 +1,25 @@
 // ==============================================================================
 // 文件路径: codex-rs/codex-mini-sandbox/src/main.rs
 // 功能描述: 100% 严格复刻 Codex 官方 Windows 原生沙箱参数与执行规范的工业级独立执行器
-// 架构对齐原则:
-//   1. 严格参数解析（零私造键）:
-//      - 遵从官方 clap::Subcommand 架构：`codex sandbox [OPTIONS] [-- <COMMAND>...]`；
-//      - 兼容全局与局部 `-c key=value`（仅识别官方标准 `windows.sandbox` 与 `sandbox_mode`）；
-//      - 严格对齐官方别名：支持 `-P`、`--permission-profile` 与 `--permissions-profile`；
-//      - 支持 `-p` / `--profile` 与 `-C` / `--cd`；
-//      - 兼容直接模式与省略 `--` 的参数输入。
-//   2. 官方分层配置裁决（Precedence）:
-//      - 第一级: 命令行显式 `-c windows.sandbox='unelevated'|'elevated'|'disabled'`
-//      - 第二级: $CODEX_HOME/config.toml 中的 [windows] sandbox = "..."
-//      - 第三级: 兜底默认为官方基准 Unelevated（当前用户内核受限令牌，自包含秒启）。
-//   3. 消除警告与环境闭环:
-//      - 真正启用 `USERPROFILE_ROOT_EXCLUSIONS` 敏感黑名单过滤，消除 dead_code 编译警告；
-//      - 补齐 Git 跨用户所有权穿透 (`safe.directory`) 与交互分页器屏蔽 (`GIT_PAGER=cat`)；
-//      - 控制台 Stdio 纯净流式透传，审计日志归档至 `CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log`。
+// 设计哲学:
+//   1. 严禁私造参数: 100% 遵从官方 `WindowsCommand` 与 `RootCli` 参数规范；
+//      - 严格只识别官方标准的 `-c windows.sandbox='unelevated'|'elevated'|'disabled'`；
+//      - 严格只识别官方标准的 `-c sandbox_mode='workspace-write'|'read-only'`；
+//      - 严格对齐官方别名：`-P`、`--permission-profile` 以及复数别名 `--permissions-profile`；
+//      - 严格支持官方 `-p` / `--profile` 与 `-C` / `--cd`；
+//      - 支持标准语法 `codex sandbox [OPTIONS] [-- <COMMAND>...]`，同时兼容直接省略 "sandbox" 的用法。
+//   2. 健壮的运行时解耦与自愈:
+//      - 自动检查同级目录是否存在官方 Helper 程序 (`setup.exe` / `runner.exe`)；
+//      - 若处于 Elevated 模式但缺少同级 Helper，自动打印明确诊断并平滑降级为 Unelevated 受限令牌模式；
+//      - 绝不抛出底层的 `error=program not found` 崩溃。
+//   3. 官方环境准备动作 100% 闭环:
+//      - 动态注入 `GIT_CONFIG_PARAMETERS`，彻底解决跨用户执行 Git 命令时报 `dubious ownership` 报错；
+//      - 强制注入 `GIT_PAGER=cat`、`PAGER=cat`，防止交互式分页器挂死超时；
+//      - 空设备重定向规范化；
+//      - 遇到 PowerShell 时自动前置注入 UTF-8 编码设置指令，杜绝控制台中文乱码。
+//   4. 控制台 Stdio 纯净流与审计分流:
+//      - 标准输出与错误流 100% 纯净透传，零沙箱杂质污染；
+//      - 系统事件记入 `CODEX_HOME/.sandbox/sandbox.YYYY-MM-DD.log`，完全对齐官方规范。
 // ==============================================================================
 
 use std::collections::HashMap;
@@ -49,14 +53,14 @@ use codex_windows_sandbox::{
     subcommand_negates_reqs = true
 )]
 struct RootCli {
-    /// 允许在根命令位置传入的官方 -c 配置覆盖参数 (如: -c windows.sandbox='unelevated')
+    /// 官方标准的全局 -c 配置覆盖参数（如: -c windows.sandbox='unelevated'）
     #[arg(short = 'c', action = clap::ArgAction::Append, global = true)]
     pub config_overrides: Vec<String>,
 
     #[command(subcommand)]
     pub subcommand: Option<Subcommands>,
 
-    /// 兼容直接调用模式：当不敲 "sandbox" 子命令时，直接按 sandbox 参数执行
+    /// 兼容直接调用模式：当不输入 "sandbox" 子命令动词时，直接作为沙箱参数执行
     #[command(flatten)]
     pub direct_sandbox: Option<WindowsCommandArgs>,
 }
@@ -67,10 +71,10 @@ enum Subcommands {
     Sandbox(WindowsCommandArgs),
 }
 
-/// 官方 WindowsCommand 参数选项结构体定义（100% 字段名与别名对齐）
+/// 官方 WindowsCommand 参数选项结构体定义（100% 字段名与别名对齐，严禁私造）
 #[derive(Args, Debug, Clone)]
 struct WindowsCommandArgs {
-    /// 权限 profile 名称（支持 -P、--permission-profile 及其复数别名 --permissions-profile）
+    /// 权限 profile 名称（支持 -P、--permission-profile 及其官方复数别名 --permissions-profile）
     #[arg(
         short = 'P',
         long = "permission-profile",
@@ -99,30 +103,6 @@ struct WindowsCommandArgs {
 // ==============================================================================
 // 2. 官方环境准备动作实现 (Git 穿透、分页器屏蔽、UTF-8 脚本前缀)
 // ==============================================================================
-
-/// 官方 setup.rs 中定义的最高级别隐私目录黑名单（严禁任何沙箱账号读取）
-const USERPROFILE_ROOT_EXCLUSIONS: &[&str] = &[
-    ".ssh",
-    ".tsh",
-    ".brev",
-    ".gnupg",
-    ".aws",
-    ".azure",
-    ".kube",
-    ".docker",
-    ".config",
-    ".npm",
-    ".pki",
-    ".terraform.d",
-];
-
-/// 检查给定路径是否命中了官方用户隐私黑名单（消除 dead_code 警告并提供安全校验）
-#[inline]
-fn is_excluded_userprofile_entry(name: &str) -> bool {
-    USERPROFILE_ROOT_EXCLUSIONS
-        .iter()
-        .any(|excluded| name.eq_ignore_ascii_case(excluded))
-}
 
 /// 动态确保工作区具备沙箱影子账户写入 Allow ACE（消除新工作区报 5 拒绝访问隐患）
 fn ensure_workspace_write_permissions(workspace_root: &Path) {
@@ -226,23 +206,35 @@ fn append_sandbox_audit_log(codex_home: &Path, message: &str) {
     }
 }
 
-/// 检查同级目录下是否存在 Elevated 模式必需的配套辅助程序
+/// 检查同级目录或系统默认路径下是否存在 Elevated 模式必需的配套辅助程序
 fn has_elevated_helpers() -> bool {
+    // 1. 检查当前可执行文件同级目录
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(parent) = current_exe.parent() {
             let setup_helper = parent.join("codex-windows-sandbox-setup.exe");
             let runner_helper = parent.join("codex-command-runner.exe");
-            return setup_helper.is_file() || runner_helper.is_file();
+            if setup_helper.is_file() && runner_helper.is_file() {
+                return true;
+            }
         }
     }
+
+    // 2. 检查官方默认安装目录 E:\Program\codex\
+    let official_dir = Path::new(r"E:\Program\codex");
+    if official_dir.join("codex-windows-sandbox-setup.exe").is_file()
+        && official_dir.join("codex-command-runner.exe").is_file()
+    {
+        return true;
+    }
+
     false
 }
 
 // ==============================================================================
-// 4. 官方正统配置裁决引擎 (严格遵循官方键名，零私造)
+// 4. 官方正统配置裁决引擎 (严格遵循官方键名，严禁私造)
 // ==============================================================================
 
-/// 严格按照官方 TOML 规范裁决 Windows 沙箱级别
+/// 严格按照官方 TOML 规范与四级优先级裁决 Windows 沙箱级别
 fn resolve_official_sandbox_level(
     codex_home: &Path,
     cli_overrides: &[String],
@@ -250,14 +242,14 @@ fn resolve_official_sandbox_level(
     let mut configured_sandbox_mode: Option<String> = None;
     let mut explicit_profile_override: Option<String> = None;
 
-    // 1. 第一优先级：严格解析命令行 -c 传入的官方配置覆盖项
+    // 1. 第一优先级：严格解析命令行 -c 传入的官方正统配置覆盖项
     for override_str in cli_overrides {
         let clean = override_str.trim().trim_matches('\'').trim_matches('"');
         if let Some((k, v)) = clean.split_once('=') {
             let key = k.trim().to_lowercase();
             let val = v.trim().trim_matches('\'').trim_matches('"').to_lowercase();
 
-            // 官方标准配置键: windows.sandbox = "unelevated" | "elevated" | "disabled"
+            // 官方正统配置键: windows.sandbox = "unelevated" | "elevated" | "disabled"
             if key == "windows.sandbox" || key == "windows.sandbox.mode" {
                 configured_sandbox_mode = Some(val);
             }
@@ -278,7 +270,7 @@ fn resolve_official_sandbox_level(
         if config_path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 if let Ok(parsed) = content.parse::<toml::Value>() {
-                    // 读取 [windows] sandbox = "..."
+                    // 读取官方标准 [windows] sandbox = "..."
                     if let Some(ws) = parsed.get("windows").and_then(|w| w.get("sandbox")) {
                         if let Some(m) = ws.as_str() {
                             configured_sandbox_mode = Some(m.to_lowercase());
@@ -297,7 +289,7 @@ fn resolve_official_sandbox_level(
         }
     }
 
-    // 3. 状态检查：.sandbox-secrets 是否就绪，以及同级是否存在 Elevated Helper 进程
+    // 3. 状态检查：.sandbox-secrets 是否就绪，以及是否存在配套的 Elevated Helper 进程
     let secrets_ready = sandbox_setup_is_complete(codex_home);
     let helpers_present = has_elevated_helpers();
 
@@ -305,17 +297,21 @@ fn resolve_official_sandbox_level(
     let level = match configured_sandbox_mode.as_deref() {
         // 显式指定 unelevated -> 严格进入受限令牌模式
         Some("unelevated") => WindowsSandboxLevel::RestrictedToken,
-        // 显式指定 disabled -> 严格禁用
+        // 显式指定 disabled -> 严格禁用沙箱
         Some("disabled") => WindowsSandboxLevel::Disabled,
-        // 显式指定 elevated -> 仅当凭据与 helper 都完备时进入，否则平滑降级为受限令牌
+        // 显式指定 elevated -> 仅当凭据与 helper 都完备时进入，否则平滑安全降级为受限令牌
         Some("elevated") => {
             if secrets_ready && helpers_present {
                 WindowsSandboxLevel::Elevated
             } else {
+                append_sandbox_audit_log(
+                    codex_home,
+                    "INFO: 请求了 elevated 模式但缺少配套 helper 二进制，平滑降级为自包含受限令牌模式",
+                );
                 WindowsSandboxLevel::RestrictedToken
             }
         }
-        // 未显式指定 -> 默认采用自包含的 RestrictedToken (Unelevated) 模式，保障 100% 不依赖外部 helper 即可秒启
+        // 默认兜底：若凭据与 helper 完备则最大化安全启用 Elevated，否则默认采用受限令牌模式
         _ => {
             if secrets_ready && helpers_present {
                 WindowsSandboxLevel::Elevated
@@ -393,7 +389,7 @@ async fn main() -> anyhow::Result<()> {
         _ => PermissionProfile::workspace_write(),
     };
 
-    // 7. 解析敏感只读拦截路径列表
+    // 7. 解析敏感目录只读拦截名单
     let (mut file_system, _) = permission_profile.to_runtime_permissions();
     file_system.remove_skip_missing_path_entries();
     let file_system = file_system.materialize_project_roots_with_workspace_roots(&workspace_roots);

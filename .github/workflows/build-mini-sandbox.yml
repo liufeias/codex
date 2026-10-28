@@ -1,8 +1,8 @@
 # ==============================================================================
-# 工作流名称: 编译构建 Codex 原生全套沙箱套件 (Suite 3-in-1 Packaging)
+# 工作流名称: 编译构建 Codex 原生全套沙箱套件 (Suite 3-in-1 Lean Packaging)
 # 触发策略: 仅限维护人员在 GitHub 网页控制台手动点击触发 (workflow_dispatch)
 # 运行环境: Windows Server 最新镜像 (windows-latest)
-# 套件清单:
+# 编译目标清单 (彻底排除 V8/TUI 等无关代码，只编译沙箱必需组件):
 #   1. codex-mini-sandbox.exe (~2.0MB, 100% 官方特征对齐的超轻量主控)
 #   2. codex-windows-sandbox-setup.exe (~1.5MB, 负责权限刷新与防火墙配置的官方 Helper)
 #   3. codex-command-runner.exe (~1.5MB, 负责影子账户隔离执行的官方 Runner)
@@ -75,7 +75,7 @@ jobs:
           }
           Write-Host "✅ 工作区环境就绪！"
 
-      # 5. 执行 Cargo 编译：同时编译沙箱主控与两个不可或缺的官方 Helper 程序
+      # 5. 精准编译：严格只编译沙箱 3 个目标二进制，绝不编译无关模块
       - name: 执行 Cargo 套件全量编译 (Build Full Sandbox Suite)
         shell: pwsh
         run: |
@@ -83,6 +83,7 @@ jobs:
           $buildProfile = "${{ github.event.inputs.build_profile }}"
           Write-Host "🚀 开始编译沙箱三位一体全套二进制组件 (模式: $buildProfile)..."
 
+          # 明确指定这 3 个二进制目标，彻底绕开 V8、WezTerm、TUI、WebRTC 等无关庞大依赖
           $cargoArgs = @(
               "build",
               "-p", "codex-mini-sandbox",
