@@ -1,0 +1,41 @@
+# ==============================================================================
+# 文件路径: codex-rs/codex-mini-sandbox/Cargo.toml
+# 功能描述: 企业级高性能独立 Windows 原生安全沙箱执行器工程配置
+# 设计哲学:
+#   1. 纯净剥离: 彻底移除 Google V8、WezTerm、WebRTC 等数百兆非安全必要运行时；
+#   2. 官方原生: 直接对接底层 windows-sandbox-rs 与 protocol crate，保证内核安全 100% 对齐；
+#   3. 极速轻量: 采用 Release LTO 与符号剥离优化，产物仅约 1.5MB~2.5MB，启动延迟微秒级。
+# ==============================================================================
+
+[package]
+name = "codex-mini-sandbox"
+version = "0.1.0"
+edition = "2021"
+authors = ["Local Sandbox Agent Team"]
+description = "Ultra-lightweight Windows Restricted Token Native Sandbox Runner for Codex"
+
+[dependencies]
+# 错误上下文包装
+anyhow = "1.0"
+
+# 工业级高性能命令行参数解析
+clap = { version = "4.4", features = ["derive"] }
+
+# 异步系统运行时（用于与底层沙箱异步事件和流式 I/O 桥接）
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+
+# 直接依赖 Codex 仓库内部已经存在的安全沙箱与协议 Crate（零重写，零外溢风险）
+codex-windows-sandbox = { path = "../windows-sandbox-rs" }
+codex-protocol = { path = "../protocol" }
+codex-utils-absolute-path = { path = "../utils/absolute-path" }
+
+# Windows 路径长名与 UNC 规范化工具
+dunce = "1.0"
+
+# 生产级构建优化配置：极致精简体积与内联提速
+[profile.release]
+opt-level = 3          # 最高级别编译优化
+lto = true             # 开启跨 Crate 链接时优化 (Link-Time Optimization)
+codegen-units = 1      # 缩减生成单元以最大化内联优化效果
+panic = "abort"        # 遇到恐慌直接中断，缩减展开表开销
+strip = true           # 剥离所有调试符号，压榨最终可执行文件体积

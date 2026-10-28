@@ -1,0 +1,275 @@
+# ==============================================================================
+# 工作流名称: 构建 Codex 独立专属微型安全沙箱 (codex-mini-sandbox)
+# 触发策略: 仅允许维护人员手动在 GitHub 网页端控制台触发 (workflow_dispatch)
+# 运行环境: Windows Server 最新宿主环境 (windows-latest)
+# ==============================================================================
+
+name: Build Codex Mini Sandbox
+
+# ------------------------------------------------------------------------------
+# 触发器配置：仅限手动触发，完全禁用自动推流触发
+# ------------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: '选择构建配置预设 (Build Profile)'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      enable_lto:
+        description: '是否启用 LTO 链接时深度优化 (体积更小、速度更快，仅 Release 有效)'
+        required: true
+        default: true
+        type: boolean
+
+# 默认权限控制：遵循最小特权原则
+permissions:
+  contents: read
+
+# ------------------------------------------------------------------------------
+# 构建任务主体
+# ------------------------------------------------------------------------------
+jobs:
+  build-windows-sandbox:
+    name: 编译 Windows 原生轻量安全沙箱 (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+
+    steps:
+      # 1. 检出仓库完整源码
+      - name: 检出当前代码仓库 (Checkout Repository)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # 2. 准备 Rust 稳定版编译器与 MSVC 工具链
+      - name: 配置 Rust 官方编译环境 (Setup Rust Toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 3. 启用 Cargo 构建缓存以极大缩减依赖编译时间
+      - name: 配置 Cargo 依赖缓存 (Cargo Cache)
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 以工作流名称作为缓存键区分标志
+          shared-key: "codex-mini-sandbox-cache"
+
+      # 4. 自动化环境探针与自动补全自愈（防止用户未将 mini-sandbox 源码提交至仓库）
+      - name: 探查并确保 mini-sandbox 源码与 Workspace 完整挂载
+        shell: pwsh
+        run: |
+          Write-Host "[1/3] 探查 Codex Rust 工作区根目录位置..."
+          
+          # 自动定位 Cargo.toml 所在的工作区根目录（优先使用 codex-rs，不存在则使用根目录）
+          $rustRoot = if (Test-Path "codex-rs/Cargo.toml") { "codex-rs" } else { "." }
+          Write-Host "   -> 锁定 Rust 工作区物理路径: $rustRoot"
+          echo "RUST_ROOT=$rustRoot" >> $env:GITHUB_ENV
+
+          $targetCrateDir = "$rustRoot/codex-mini-sandbox"
+          $targetCargoToml = "$targetCrateDir/Cargo.toml"
+          $targetMainRs = "$targetCrateDir/src/main.rs"
+
+          # 自愈防护：若仓库中尚未包含该模块，直接现场生成工业级标准代码
+          if (-not (Test-Path $targetCargoToml) -or -not (Test-Path $targetMainRs)) {
+              Write-Host "[2/3] 检测到仓库尚未预先提交 codex-mini-sandbox，启动自动化生成装配..."
+              New-Item -ItemType Directory -Force -Path "$targetCrateDir/src" | Out-Null
+
+              # 写入 codex-mini-sandbox/Cargo.toml
+              $cargoContent = @"
+          [package]
+          name = "codex-mini-sandbox"
+          version = "0.1.0"
+          edition = "2021"
+
+          [dependencies]
+          anyhow = "1.0"
+          clap = { version = "4.4", features = ["derive"] }
+          tokio = { version = "1.35", features = ["macros", "rt-multi-thread"] }
+          codex-windows-sandbox = { path = "../windows-sandbox-rs" }
+          codex-protocol = { path = "../protocol" }
+          codex-utils-absolute-path = { path = "../utils/absolute-path" }
+          dunce = "1.0"
+          "@
+              Set-Content -Path $targetCargoToml -Value $cargoContent -Encoding utf8
+
+              # 写入 codex-mini-sandbox/src/main.rs
+              $mainContent = @"
+          use std::collections::HashMap;
+          use std::path::PathBuf;
+          use clap::Parser;
+          use codex_protocol::config_types::WindowsSandboxLevel;
+          use codex_protocol::models::PermissionProfile;
+          use codex_utils_absolute_path::AbsolutePathBuf;
+          use codex_windows_sandbox::{
+              forward_sandbox_session_stdio,
+              resolve_windows_deny_read_paths,
+              spawn_windows_sandbox_session_for_level,
+              WindowsSandboxProxySettingsMode,
+              WindowsSandboxSessionRequest,
+          };
+
+          #[derive(Parser, Debug)]
+          #[command(name = "codex-mini-sandbox", about = "Codex Windows Native Sandbox", trailing_var_arg = true)]
+          struct Cli {
+              #[arg(value_parser = ["sandbox"])]
+              _dummy_subcmd: Option<String>,
+              #[arg(short = 'P', long = "permission-profile", default_value = ":workspace")]
+              permission_profile: String,
+              #[arg(short = 'C', long = "cd")]
+              cwd: PathBuf,
+              #[arg(required = true)]
+              command: Vec<String>,
+          }
+
+          #[tokio::main]
+          async fn main() -> anyhow::Result<()> {
+              let cli = Cli::parse();
+              if cli.command.is_empty() {
+                  eprintln!("[codex-mini-sandbox] 错误: 未提供待执行命令！");
+                  std::process::exit(1);
+              }
+              let cwd_canonical = dunce::canonicalize(&cli.cwd)
+                  .map_err(|e| anyhow::anyhow!("工作区目录无法访问 [{}]: {e}", cli.cwd.display()))?;
+              let cwd = AbsolutePathBuf::from_absolute_path(&cwd_canonical)?;
+              let workspace_roots = vec![cwd.clone()];
+
+              let codex_home = match std::env::var_os("CODEX_HOME") {
+                  Some(val) => PathBuf::from(val),
+                  None => {
+                      let user_profile = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string());
+                      PathBuf::from(user_profile).join(".codex")
+                  }
+              };
+
+              let permission_profile = match cli.permission_profile.as_str() {
+                  ":workspace" => PermissionProfile::workspace_write(),
+                  ":read-only" | ":readonly" => PermissionProfile::read_only(),
+                  _ => PermissionProfile::workspace_write(),
+              };
+
+              let (mut file_system, _) = permission_profile.to_runtime_permissions();
+              file_system.remove_skip_missing_path_entries();
+              let file_system = file_system.materialize_project_roots_with_workspace_roots(&workspace_roots);
+              let deny_read_paths = resolve_windows_deny_read_paths(&file_system, &cwd).unwrap_or_default();
+
+              let env_map: HashMap<String, String> = std::env::vars().collect();
+              let empty_paths: &[AbsolutePathBuf] = &[];
+
+              let spawned = spawn_windows_sandbox_session_for_level(WindowsSandboxSessionRequest {
+                  permission_profile: &permission_profile,
+                  workspace_roots: workspace_roots.as_slice(),
+                  codex_home: codex_home.as_path(),
+                  command: cli.command,
+                  cwd: cwd.as_path(),
+                  env_map,
+                  windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
+                  proxy_settings_mode: WindowsSandboxProxySettingsMode::Preserve,
+                  proxy_enforced: false,
+                  network_proxy_restricting_sid: None,
+                  timeout_ms: None,
+                  read_roots_override: None,
+                  read_roots_include_platform_defaults: false,
+                  write_roots_override: None,
+                  deny_read_paths_override: &deny_read_paths,
+                  deny_write_paths_override: empty_paths,
+                  tty: false,
+                  stdin_open: true,
+              }).await.map_err(|e| anyhow::anyhow!("沙箱子进程启动失败: {e}"))?;
+
+              let exit_code = forward_sandbox_session_stdio(spawned).await;
+              std::process::exit(exit_code);
+          }
+          "@
+              Set-Content -Path $targetMainRs -Value $mainContent -Encoding utf8
+              Write-Host "   -> 源码装配完毕。"
+          }
+
+          # 确保根目录 Cargo.toml 的 workspace.members 包含了 codex-mini-sandbox
+          Write-Host "[3/3] 检查工作区清单 members 配置..."
+          $rootTomlPath = "$rustRoot/Cargo.toml"
+          $rootTomlContent = Get-Content -Raw -Path $rootTomlPath
+          if ($rootTomlContent -notmatch "codex-mini-sandbox") {
+              Write-Host "   -> 向 $rootTomlPath 动态追加工作区成员: codex-mini-sandbox"
+              $updatedToml = $rootTomlContent -replace 'members\s*=\s*\[', "members = [`n    `"codex-mini-sandbox`","
+              Set-Content -Path $rootTomlPath -Value $updatedToml -Encoding utf8
+          }
+          Write-Host "✅ 环境准备就绪！"
+
+      # 5. 执行 Cargo 编译构建
+      - name: 执行 Cargo 编译 (Build codex-mini-sandbox)
+        shell: pwsh
+        run: |
+          cd $env:RUST_ROOT
+          $buildProfile = "${{ github.event.inputs.build_profile }}"
+          Write-Host "🚀 开始编译目标: codex-mini-sandbox (模式: $buildProfile)..."
+
+          $cargoArgs = @("build", "-p", "codex-mini-sandbox")
+          if ($buildProfile -eq "release") {
+              $cargoArgs += "--release"
+          }
+
+          # 启动编译过程
+          & cargo @cargoArgs
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "❌ 编译失败，退出码: $LASTEXITCODE"
+              exit $LASTEXITCODE
+          }
+          Write-Host "✅ 编译构建成功！"
+
+      # 6. 整理编译产物、统计体积并生成 SHA256 完整性哈希
+      - name: 收集与审计编译产物 (Collect Artifacts & Checksum)
+        shell: pwsh
+        run: |
+          $buildProfile = "${{ github.event.inputs.build_profile }}"
+          
+          # 定位产物路径（考虑 workspace 的 target 输出位置）
+          $possiblePaths = @(
+              "$env:RUST_ROOT/target/$buildProfile/codex-mini-sandbox.exe",
+              "target/$buildProfile/codex-mini-sandbox.exe"
+          )
+
+          $exePath = $null
+          foreach ($path in $possiblePaths) {
+              if (Test-Path $path) {
+                  $exePath = Resolve-Path $path
+                  break
+              }
+          }
+
+          if (-not $exePath) {
+              Write-Error "❌ 未能找到编译产物 codex-mini-sandbox.exe！"
+              exit 1
+          }
+
+          # 创建归档发布目录
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item -Path $exePath -Destination "dist/codex-mini-sandbox.exe" -Force
+
+          # 获取文件体积
+          $fileItem = Get-Item "dist/codex-mini-sandbox.exe"
+          $sizeMb = [math]::Round($fileItem.Length / 1MB, 2)
+          Write-Host "📦 最终产物绝对路径: $($fileItem.FullName)"
+          Write-Host "📏 最终可执行文件体积: $sizeMb MB"
+
+          # 计算 SHA-256 哈希
+          $hash = (Get-FileHash -Path "dist/codex-mini-sandbox.exe" -Algorithm SHA256).Hash
+          Set-Content -Path "dist/codex-mini-sandbox.exe.sha256" -Value "$hash *codex-mini-sandbox.exe"
+
+          Write-Host "=========================================================="
+          Write-Host "   SHA256 校验和: $hash"
+          Write-Host "=========================================================="
+
+      # 7. 上传编译产物至 GitHub Actions Artifacts
+      - name: 上传可执行文件工件 (Upload Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-mini-sandbox-windows-x86_64
+          path: |
+            dist/codex-mini-sandbox.exe
+            dist/codex-mini-sandbox.exe.sha256
+          if-no-files-found: error
+          retention-days: 30
