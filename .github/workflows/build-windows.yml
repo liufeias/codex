@@ -1,0 +1,56 @@
+name: Build Full Codex for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: "codex-rs -> target"
+
+    - name: Build Codex Binaries
+      working-directory: ./codex-rs
+      # 把主程序和辅助沙盒工具全都编译出来
+      run: |
+        cargo build --release -p codex-cli --bin codex
+        cargo build --release -p codex-windows-sandbox-rs --bin codex-command-runner
+        cargo build --release -p codex-windows-sandbox-rs --bin codex-windows-sandbox-setup
+        cargo build --release -p codex-code-mode-host --bin codex-code-mode-host
+
+    - name: Prepare Output Directory
+      shell: powershell
+      run: |
+        # 创建一个用于打包的文件夹
+        New-Item -ItemType Directory -Force -Path .\release-package
+        New-Item -ItemType Directory -Force -Path .\release-package\codex-path
+        
+        # 把编译好的 exe 复制进去，并按官方命名
+        Copy-Item -Path .\codex-rs\target\release\codex.exe -Destination .\release-package\codex-x86_64-pc-windows-msvc.exe
+        Copy-Item -Path .\codex-rs\target\release\codex-command-runner.exe -Destination .\release-package\
+        Copy-Item -Path .\codex-rs\target\release\codex-windows-sandbox-setup.exe -Destination .\release-package\
+        Copy-Item -Path .\codex-rs\target\release\codex-code-mode-host.exe -Destination .\release-package\
+        
+        # 下载官方的 ripgrep 并放入 codex-path
+        Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep-14.1.0-x86_64-pc-windows-msvc.zip" -OutFile "rg.zip"
+        Expand-Archive -Path "rg.zip" -DestinationPath ".\rg-temp"
+        Copy-Item -Path ".\rg-temp\ripgrep-14.1.0-x86_64-pc-windows-msvc\rg.exe" -Destination ".\release-package\codex-path\"
+
+    - name: Upload Full Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: codex-windows-full
+        path: ./release-package/
+        retention-days: 7
