@@ -125,14 +125,14 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
         web_search_tool_type: WebSearchToolType::Text,
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
         supports_image_detail_original: false,
-        context_window: Some(272_000),
-        max_context_window: Some(272_000),
+        context_window: Some(1_000_000),
+        max_context_window: Some(1_000_000),
         auto_compact_token_limit: None,
         comp_hash: None,
         effective_context_window_percent: 95,
         experimental_supported_tools: Vec::new(),
         input_modalities: default_input_modalities(),
-        used_fallback_model_metadata: true, // this is the fallback model metadata
+        used_fallback_model_metadata: false, // this is the fallback model metadata
         supports_search_tool: false,
         supports_experimental_context: false,
         use_responses_lite: false,
